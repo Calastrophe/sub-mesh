@@ -49,12 +49,16 @@ header = "x-webauth-user"   # the default
 ```
 
 A request from one of `addrs` is admitted by the login in `header`,
-following the `[consumers]` logins as whois would; its node shows as
-`via-proxy`. A request from a proxy address without exactly one plausible
-login is refused, as are browser requests that another site made. Daemon
-routes are refused through the proxy: daemons connect to the server directly
-over the tailnet. From other addresses the header is ignored, and it is
-never forwarded to daemons. The proxy must keep the request's `Host`.
+following the `[consumers]` or `[daemons]` logins as whois would; a consumer
+shows as node `via-proxy`. Daemons can connect through the proxy too: a
+daemon gets exactly the rights its login would have by whois, and its node
+name (from `node` in `daemon.toml`, by default its host name) is only a
+label under that login, so a node name that a daemon of another login holds
+is refused. ACL tags are unknown through the proxy, so `tags` never match
+there. A request from a proxy address without exactly one plausible login is
+refused, as are browser requests that another site made. From other
+addresses the header is ignored, and it is never forwarded to daemons. The
+proxy must keep the request's `Host`.
 
 With Caddy and the `tailscale_auth` plugin (`route` keeps the directives in
 this order, so the header is set after authentication and replaces any value
@@ -70,11 +74,46 @@ mesh.example.com {
 }
 ```
 
+The daemon tunnel is an HTTP/1.1 `Upgrade` (`mesh-tunnel/1`), which Caddy's
+`reverse_proxy` passes through as it does WebSockets; reloading Caddy's
+config closes it, and the daemon dials again. Point daemons at the proxy
+with an `https://` URL:
+
+```toml
+server_url = "https://mesh.example.com"
+```
+
+Over `https://` the daemon checks the server's certificate against the
+public web PKI roots, offers only HTTP/1.1, and skips the whois check of
+`[allowed_peers]`, which applies to `http://` servers only. The daemon's
+machine must reach the proxy over the tailnet, so that `tailscale_auth`
+can identify it.
+
+**A server without Tailscale.** When every caller comes through the proxy,
+the server host needs no tailscaled:
+
+```toml
+listen = "10.10.10.102:7070"
+[trusted_proxy]
+addrs = ["10.10.10.111"]
+only = true
+[consumers]
+logins = ["you@example.com", "friend@example.com"]
+[daemons]
+logins = ["you@example.com", "friend@example.com"]
+```
+
+With `only`, whois is never asked and other addresses are refused (loopback
+too, unless `allow_loopback` is set). The server cannot learn its own login
+without tailscaled, so `logins` must be listed for both tables.
+
 **Warning:** anyone who can connect from a trusted address can act as any
 user. Use an address that only the proxy can use, make the proxy replace any
 `X-Webauth-User` header a client sends, and do not list a shared address such
 as `127.0.0.1` on a machine where other users or programs run. A listed
-address is never checked with whois, even when `allow_loopback` is on.
+address is never checked with whois, even when `allow_loopback` is on. With
+`only`, bind `listen` to an address that only the proxy can reach, or
+firewall it.
 
 ## Clients
 

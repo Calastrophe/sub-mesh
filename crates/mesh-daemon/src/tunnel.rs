@@ -99,7 +99,7 @@ async fn connect_once(state: &Arc<AppState>, router: Router) -> Outcome {
         Ok(dial) => dial,
         Err(err) => return Outcome::failed(format!("cannot connect to the server: {err}")),
     };
-    if let Err(reason) = peer::verify_server(state, dial.peer_addr()).await {
+    if let Err(reason) = peer::verify_dial(state, &dial).await {
         return Outcome::failed(reason);
     }
     let io = match dial.upgrade(&settings.node).await {

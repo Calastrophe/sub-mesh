@@ -91,6 +91,9 @@ fn validate_report(report: &DaemonReport) -> Result<(), String> {
     if report.node.trim().is_empty() {
         return Err("empty node name".to_owned());
     }
+    if !mesh_core::protocol::valid_node_name(&report.node) {
+        return Err("invalid node name".to_owned());
+    }
     Ok(())
 }
 
@@ -111,6 +114,14 @@ mod tests {
         assert!(validate_report(&report).is_ok());
         report.node = " ".to_owned();
         assert!(validate_report(&report).is_err());
+        for bad in [
+            " n",
+            "n\u{0}",
+            &"n".repeat(mesh_core::protocol::MAX_NODE_NAME + 1),
+        ] {
+            report.node = bad.to_owned();
+            assert!(validate_report(&report).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

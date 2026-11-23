@@ -41,6 +41,12 @@ pub struct TrustedProxy {
     pub addrs: Vec<IpAddr>,
     /// The header that carries the caller's tailnet login.
     pub header: String,
+    /// Every caller comes through the proxy, and the server host has no
+    /// tailscaled: whois is never asked, and callers from other addresses
+    /// are refused (except loopback where `allow_loopback` allows it).
+    /// Needs `addrs` and explicit `logins` in `[consumers]` and `[daemons]`,
+    /// since the server cannot learn its own login.
+    pub only: bool,
 }
 
 impl Default for TrustedProxy {
@@ -48,6 +54,7 @@ impl Default for TrustedProxy {
         TrustedProxy {
             addrs: Vec::new(),
             header: "x-webauth-user".to_owned(),
+            only: false,
         }
     }
 }
@@ -81,8 +88,8 @@ pub struct Config {
     pub consumers: PeerPolicy,
     /// Who may send daemon reports.
     pub daemons: PeerPolicy,
-    /// A reverse proxy whose identity header is trusted for consumer
-    /// requests. Off by default.
+    /// A reverse proxy whose identity header is trusted for consumer and
+    /// daemon requests. Off by default.
     pub trusted_proxy: TrustedProxy,
     /// Skip every peer check. For development only.
     pub insecure_skip_whois: bool,
@@ -160,6 +167,17 @@ impl Config {
                 "trusted_proxy.header {:?} is not a header name",
                 self.trusted_proxy.header
             );
+        }
+        if self.trusted_proxy.only && !self.insecure_skip_whois {
+            if self.trusted_proxy.addrs.is_empty() {
+                bail!("trusted_proxy.only needs trusted_proxy.addrs");
+            }
+            if self.consumers.logins.is_empty() || self.daemons.logins.is_empty() {
+                bail!(
+                    "trusted_proxy.only needs consumers.logins and daemons.logins: \
+                     without tailscaled the server cannot learn its own login"
+                );
+            }
         }
         if let Some(dir) = &self.web_dir {
             if !dir.is_dir() {
@@ -334,6 +352,28 @@ mod tests {
             "[trusted_proxy]\nheader = \"\"",
             "[trusted_proxy]\nheader = \"bad header\"",
             "[trusted_proxy]\naddr = [\"10.10.10.111\"]",
+        ] {
+            assert!(Config::from_toml(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_proxy_only_server_needs_addresses_and_logins() {
+        let full = r#"
+            [trusted_proxy]
+            addrs = ["10.10.10.111"]
+            only = true
+            [consumers]
+            logins = ["a@example.com"]
+            [daemons]
+            logins = ["a@example.com"]
+        "#;
+        assert!(Config::from_toml(full).expect("parse").trusted_proxy.only);
+        assert!(!Config::from_toml("").expect("parse").trusted_proxy.only);
+        for bad in [
+            "[trusted_proxy]\nonly = true\n[consumers]\nlogins = [\"a\"]\n[daemons]\nlogins = [\"a\"]",
+            "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[daemons]\nlogins = [\"a\"]",
+            "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]",
         ] {
             assert!(Config::from_toml(bad).is_err(), "{bad}");
         }

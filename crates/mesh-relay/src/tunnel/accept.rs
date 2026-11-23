@@ -4,7 +4,7 @@ use bytes::Bytes;
 use http::header::{CONNECTION, CONTENT_TYPE, UPGRADE};
 use http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use hyper::upgrade::OnUpgrade;
-use mesh_core::protocol::{NODE_HEADER, TUNNEL_PROTOCOL};
+use mesh_core::protocol::{NODE_HEADER, TUNNEL_PROTOCOL, valid_node_name};
 
 use crate::Error;
 use crate::headers;
@@ -31,8 +31,8 @@ pub struct Accept {
 ///
 /// A refusal is [`Error::Rejected`], which renders as the response to
 /// send: `405` for a wrong method, `426` for a missing or wrong upgrade
-/// token, `400` for a missing node, and `500` when the connection cannot be
-/// upgraded.
+/// token, `400` for a missing or invalid node name (see
+/// [`valid_node_name`]), and `500` when the connection cannot be upgraded.
 #[allow(clippy::result_large_err)]
 pub fn accept<B>(mut request: Request<B>) -> Result<Accept, Error> {
     if request.method() != Method::GET {
@@ -57,6 +57,12 @@ pub fn accept<B>(mut request: Request<B>) -> Result<Accept, Error> {
         .filter(|node| !node.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "missing x-mesh-node header"))?;
+    if !valid_node_name(&node) {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid x-mesh-node header",
+        ));
+    }
     let upgrade = request
         .extensions_mut()
         .remove::<OnUpgrade>()

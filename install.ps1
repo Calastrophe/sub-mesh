@@ -125,8 +125,8 @@ function Install-Mesh {
     }
 
     $serverUrl = $env:MESH_SERVER_URL
-    if ($serverUrl -and $serverUrl -cnotmatch '\Ahttp://[^\s\p{Cc}"\\]+\z') {
-        throw "invalid MESH_SERVER_URL (use http://HOST:7070)"
+    if ($serverUrl -and $serverUrl -cnotmatch '\Ahttps?://[^\s\p{Cc}"\\]+\z') {
+        throw "invalid MESH_SERVER_URL (use http://HOST:7070 or https://HOST)"
     }
     if ($repo -cnotmatch '\A[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+\z') { throw 'invalid MESH_REPO' }
 

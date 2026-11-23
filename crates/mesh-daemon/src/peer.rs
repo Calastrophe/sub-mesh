@@ -2,6 +2,8 @@
 
 use std::net::SocketAddr;
 
+use mesh_relay::tunnel::Dial;
+
 use crate::state::AppState;
 
 /// A tagged node has a shared identity marker instead of a user login.
@@ -48,6 +50,18 @@ pub async fn verify_server(state: &AppState, server: SocketAddr) -> Result<(), S
         "server {server} runs as {:?}, which allowed_peers does not trust",
         whois.login_name
     ))
+}
+
+/// Check the server on `dial` before sending it anything. Over `https://`
+/// the TLS certificate for `server_url`'s host has already identified it
+/// (the host may be a reverse proxy, which tailnet whois could not
+/// identify); over `http://` its tailnet identity is checked with
+/// [`verify_server`].
+pub async fn verify_dial(state: &AppState, dial: &Dial) -> Result<(), String> {
+    if dial.is_tls() {
+        return Ok(());
+    }
+    verify_server(state, dial.peer_addr()).await
 }
 
 #[cfg(test)]

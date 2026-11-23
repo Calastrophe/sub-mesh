@@ -395,3 +395,37 @@ async fn refused_dial_is_rejected() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn an_https_url_dials_tls_offering_only_http_1_1() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hello = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut hello = vec![0u8; 4096];
+        let n = stream.read(&mut hello).await.unwrap();
+        hello.truncate(n);
+        // Not a TLS server: closing fails the handshake.
+        hello
+    });
+    let url = Url::parse(&format!("https://localhost:{port}")).unwrap();
+    let err = Dial::connect(&url).await.expect_err("no TLS server");
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    let hello = hello.await.unwrap();
+    // A TLS handshake record carrying the server name and the ALPN offer.
+    assert_eq!(hello[0], 0x16, "{hello:?}");
+    let contains = |needle: &[u8]| hello.windows(needle.len()).any(|w| w == needle);
+    assert!(contains(b"localhost"));
+    assert!(contains(b"\x08http/1.1"));
+    assert!(!contains(b"\x02h2"));
+}
+
+#[tokio::test]
+async fn other_schemes_are_refused() {
+    for url in ["ws://127.0.0.1:1", "ftp://127.0.0.1:1"] {
+        let url = Url::parse(url).unwrap();
+        assert!(matches!(Dial::connect(&url).await, Err(Error::Other(_))));
+    }
+}
