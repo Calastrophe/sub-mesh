@@ -19,7 +19,7 @@ pub async fn report(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    let peer = match authorize(&state, addr, Role::Daemon).await {
+    let peer = match authorize(&state, addr, request.headers(), Role::Daemon).await {
         Ok(peer) => peer,
         Err(response) => return *response,
     };

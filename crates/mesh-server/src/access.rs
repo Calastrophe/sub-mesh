@@ -4,20 +4,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
 use crate::peer::{Decision, Peer, Role};
 
-/// Check the peer for `role`, or produce the `403` response.
+/// Check the peer at `addr`, which sent `headers`, for `role`, or produce
+/// the `403` response.
 pub async fn authorize(
     state: &AppState,
     addr: SocketAddr,
+    headers: &HeaderMap,
     role: Role,
 ) -> Result<Peer, Box<Response>> {
-    match state.peers.check(addr, role).await {
+    match state.peers.check(addr, headers, role).await {
         Decision::Allow(peer) => Ok(peer),
         Decision::Deny(reason) => {
             tracing::warn!(%addr, ?role, %reason, "refused peer");
@@ -36,7 +38,7 @@ pub async fn consumer(
     mut request: Request,
     next: Next,
 ) -> Response {
-    match authorize(&state, addr, Role::Consumer).await {
+    match authorize(&state, addr, request.headers(), Role::Consumer).await {
         Ok(peer) => {
             request.extensions_mut().insert(peer);
             next.run(request).await

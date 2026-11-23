@@ -36,6 +36,46 @@ irm https://raw.githubusercontent.com/Calastrophe/sub-mesh/main/install.ps1 | ie
 Run `meshctl login codex` or `meshctl login claude`, then check
 `meshctl status`. Run the installer again to upgrade.
 
+## Behind a reverse proxy
+
+The server identifies callers by asking tailscaled who owns the connecting
+tailnet address. A reverse proxy that identifies tailnet users itself can
+name the caller instead. Add the proxy to `/etc/mesh/server.toml`:
+
+```toml
+[trusted_proxy]
+addrs = ["10.10.10.111"]    # the address the proxy connects from
+header = "x-webauth-user"   # the default
+```
+
+A request from one of `addrs` is admitted by the login in `header`,
+following the `[consumers]` logins as whois would; its node shows as
+`via-proxy`. A request from a proxy address without exactly one plausible
+login is refused, as are browser requests that another site made. Daemon
+routes are refused through the proxy: daemons connect to the server directly
+over the tailnet. From other addresses the header is ignored, and it is
+never forwarded to daemons. The proxy must keep the request's `Host`.
+
+With Caddy and the `tailscale_auth` plugin (`route` keeps the directives in
+this order, so the header is set after authentication and replaces any value
+the client sent):
+
+```caddy
+mesh.example.com {
+	route {
+		tailscale_auth
+		request_header X-Webauth-User {http.auth.user.tailscale_user}
+		reverse_proxy mesh-host:7070
+	}
+}
+```
+
+**Warning:** anyone who can connect from a trusted address can act as any
+user. Use an address that only the proxy can use, make the proxy replace any
+`X-Webauth-User` header a client sends, and do not list a shared address such
+as `127.0.0.1` on a machine where other users or programs run. A listed
+address is never checked with whois, even when `allow_loopback` is on.
+
 ## Clients
 
 **Claude Code**

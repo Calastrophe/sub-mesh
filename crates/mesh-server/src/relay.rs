@@ -381,7 +381,7 @@ async fn relay(
     upgrade: Upgrade,
     request: Request,
 ) -> Response {
-    match authorize(state, addr, Role::Consumer).await {
+    match authorize(state, addr, request.headers(), Role::Consumer).await {
         Ok(peer) => relay_as(state, provider, peer, upgrade, request).await,
         Err(response) => *response,
     }
@@ -402,9 +402,11 @@ pub(crate) async fn relay_as(
         return (StatusCode::BAD_REQUEST, "invalid relay path\n").into_response();
     }
     let query = parts.uri.query();
+    let mut headers = mesh_relay::forward_request_headers(&parts.headers, MeshHeaders::Strip);
+    headers.remove(state.peers.identity_header());
     let job = Job {
         method: parts.method,
-        headers: mesh_relay::forward_request_headers(&parts.headers, MeshHeaders::Strip),
+        headers,
         rest,
         query,
     };

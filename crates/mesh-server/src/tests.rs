@@ -207,6 +207,7 @@ async fn a_request_goes_over_the_tunnel_with_its_path_query_and_body() {
         .post(format!("http://{addr}/codex/v1/items?stream=true&q=a%2Fb"))
         .header("x-kept", "1")
         .header("x-mesh-internal", "secret")
+        .header("x-webauth-user", "mallory@example.com")
         .body("payload")
         .send()
         .await
@@ -222,6 +223,7 @@ async fn a_request_goes_over_the_tunnel_with_its_path_query_and_body() {
     assert_eq!(seen[0].body, "payload");
     assert_eq!(seen[0].headers["x-kept"], "1");
     assert!(!seen[0].headers.contains_key("x-mesh-internal"));
+    assert!(!seen[0].headers.contains_key("x-webauth-user"));
     let view = state
         .with_registry(|r| r.view(&"a".parse().unwrap(), Utc::now()))
         .unwrap();
@@ -966,5 +968,6 @@ async fn no_account_with_headroom_is_a_plain_503() {
 
 mod logs;
 mod models;
+mod proxy;
 mod web;
 mod websocket;

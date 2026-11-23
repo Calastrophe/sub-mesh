@@ -25,7 +25,7 @@ pub async fn tunnel(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    match authorize(&state, addr, Role::Daemon).await {
+    match authorize(&state, addr, request.headers(), Role::Daemon).await {
         Ok(peer) => connect(state, peer.login, request),
         Err(response) => *response,
     }

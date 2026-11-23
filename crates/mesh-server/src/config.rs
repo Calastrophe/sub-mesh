@@ -1,10 +1,11 @@
 //! Server configuration: the TOML file and its defaults.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use axum::http::HeaderName;
 use chrono::TimeDelta;
 use mesh_core::protocol;
 use mesh_relay::tailscale;
@@ -30,6 +31,34 @@ pub struct PeerPolicy {
     pub allow_loopback: bool,
 }
 
+/// A reverse proxy that identifies tailnet callers itself, such as Caddy
+/// with `tailscale_auth`, and names the caller's login in a header.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrustedProxy {
+    /// The proxy's addresses. Requests from them are identified by
+    /// `header` instead of whois. Empty turns the proxy support off.
+    pub addrs: Vec<IpAddr>,
+    /// The header that carries the caller's tailnet login.
+    pub header: String,
+}
+
+impl Default for TrustedProxy {
+    fn default() -> Self {
+        TrustedProxy {
+            addrs: Vec::new(),
+            header: "x-webauth-user".to_owned(),
+        }
+    }
+}
+
+impl TrustedProxy {
+    /// The identity header. The config check makes sure it parses.
+    pub fn header_name(&self) -> HeaderName {
+        HeaderName::from_bytes(self.header.as_bytes()).expect("trusted_proxy.header was validated")
+    }
+}
+
 /// The parsed server configuration.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -52,6 +81,9 @@ pub struct Config {
     pub consumers: PeerPolicy,
     /// Who may send daemon reports.
     pub daemons: PeerPolicy,
+    /// A reverse proxy whose identity header is trusted for consumer
+    /// requests. Off by default.
+    pub trusted_proxy: TrustedProxy,
     /// Skip every peer check. For development only.
     pub insecure_skip_whois: bool,
     /// The built dashboard, served at `/`. Defaults to `/usr/share/mesh/web`
@@ -72,6 +104,7 @@ impl Default for Config {
             tailscale_socket: PathBuf::from(tailscale::DEFAULT_SOCKET),
             consumers: PeerPolicy::default(),
             daemons: PeerPolicy::default(),
+            trusted_proxy: TrustedProxy::default(),
             insecure_skip_whois: false,
             web_dir: default_web_dir(),
         }
@@ -121,6 +154,12 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.affinity_min_headroom) {
             bail!("affinity_min_headroom must be between 0 and 1");
+        }
+        if HeaderName::from_bytes(self.trusted_proxy.header.as_bytes()).is_err() {
+            bail!(
+                "trusted_proxy.header {:?} is not a header name",
+                self.trusted_proxy.header
+            );
         }
         if let Some(dir) = &self.web_dir {
             if !dir.is_dir() {
@@ -257,6 +296,47 @@ mod tests {
         assert_eq!(config.cache_ttl(), TimeDelta::minutes(10));
         assert!(Config::from_toml("affinity_ttl_secs = 3600").is_err());
         assert!(Config::from_toml("cache_ttl_secs = -1").is_err());
+    }
+
+    #[test]
+    fn the_trusted_proxy_is_off_unless_configured() {
+        let config = Config::from_toml("").expect("parse");
+        assert_eq!(config.trusted_proxy, TrustedProxy::default());
+        assert!(config.trusted_proxy.addrs.is_empty());
+        assert_eq!(config.trusted_proxy.header_name(), "x-webauth-user");
+        let empty = Config::from_toml("[trusted_proxy]\naddrs = []").expect("parse");
+        assert!(empty.trusted_proxy.addrs.is_empty());
+    }
+
+    #[test]
+    fn trusted_proxy_addresses_and_header() {
+        let config = Config::from_toml(
+            r#"
+            [trusted_proxy]
+            addrs = ["10.10.10.111", "fd00::1"]
+            header = "X-Webauth-User"
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(
+            config.trusted_proxy.addrs,
+            [
+                "10.10.10.111".parse::<IpAddr>().unwrap(),
+                "fd00::1".parse().unwrap()
+            ]
+        );
+        assert_eq!(config.trusted_proxy.header_name(), "x-webauth-user");
+        for bad in [
+            "[trusted_proxy]\naddrs = [\"10.10.10.300\"]",
+            "[trusted_proxy]\naddrs = [\"proxy.example\"]",
+            "[trusted_proxy]\naddrs = [\"10.10.10.0/24\"]",
+            "[trusted_proxy]\naddrs = \"10.10.10.111\"",
+            "[trusted_proxy]\nheader = \"\"",
+            "[trusted_proxy]\nheader = \"bad header\"",
+            "[trusted_proxy]\naddr = [\"10.10.10.111\"]",
+        ] {
+            assert!(Config::from_toml(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
