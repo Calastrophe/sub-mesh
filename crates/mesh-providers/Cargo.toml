@@ -1,0 +1,29 @@
+[package]
+name = "mesh-providers"
+description = "Login, token refresh, auth headers, and usage windows for Codex and Claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mesh-core.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+http.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+
+[lints]
+workspace = true

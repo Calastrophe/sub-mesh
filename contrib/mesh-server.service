@@ -1,0 +1,36 @@
+# Manual install:
+#   sudo useradd --system --home-dir /var/lib/mesh --shell /usr/sbin/nologin mesh
+#   sudo install -m 0755 mesh-server /usr/local/bin/mesh-server
+#   sudo install -d /usr/share/mesh && sudo cp -r crates/mesh-web/dist /usr/share/mesh/web
+#   sudo install -m 0644 contrib/mesh-server.service /etc/systemd/system/
+#   sudo tailscale set --operator=mesh
+#   sudo systemctl enable --now mesh-server
+
+[Unit]
+Description=mesh server (pooled Codex and Claude subscriptions)
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mesh-server
+User=mesh
+StateDirectory=mesh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20s
+Environment=RUST_LOG=info
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

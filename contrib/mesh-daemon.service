@@ -1,0 +1,12 @@
+[Unit]
+Description=mesh daemon (shares this machine's Codex and Claude subscriptions over the tailnet; dials out to mesh-server, exposes a loopback admin API)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mesh-daemon
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

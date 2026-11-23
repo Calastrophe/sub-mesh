@@ -1,0 +1,37 @@
+[package]
+name = "mesh-server"
+description = "Central mesh server: consumer API, scheduler, and registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mesh-core.workspace = true
+mesh-relay.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+futures-util.workspace = true
+http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+rusqlite = { workspace = true, features = ["functions"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+tokio.workspace = true
+tower-http.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true
