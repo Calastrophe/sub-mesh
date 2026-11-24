@@ -5,9 +5,10 @@ use serde_json::{Value, json};
 
 use super::{
     MAX_LIMITED_COOLDOWN, limited_cooldown, model_not_found, model_not_found_body, refusal_body,
-    relay_target, unavailable, upstream_path, valid_relay_path,
+    relay_target, unavailable, upstream_path, valid_endpoint, valid_relay_path,
 };
 use crate::registry::{Candidate, DEFAULT_LIMITED_COOLDOWN};
+use axum::http::Method;
 
 fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
     let mut map = HeaderMap::new();
@@ -123,6 +124,48 @@ fn relay_paths_must_not_escape_the_relay_route() {
         relay_target(&candidate(), "/v1/data%20item", Some("q=a%2Bb")),
         "/relay/claude-ab12/v1/data%20item?q=a%2Bb"
     );
+}
+
+#[test]
+fn only_supported_provider_endpoints_and_methods_are_relayed() {
+    for (provider, method, path, websocket, expected) in [
+        (Provider::Claude, Method::POST, "/v1/messages", false, true),
+        (Provider::Claude, Method::GET, "/v1/models", false, true),
+        (
+            Provider::Claude,
+            Method::POST,
+            "/v1/messages/count_tokens",
+            false,
+            false,
+        ),
+        (Provider::Claude, Method::GET, "/v1/messages", false, false),
+        (Provider::Codex, Method::POST, "/responses", false, true),
+        (Provider::Codex, Method::GET, "/responses", true, true),
+        (
+            Provider::Codex,
+            Method::POST,
+            "/responses/compact",
+            false,
+            true,
+        ),
+        (
+            Provider::Codex,
+            Method::GET,
+            "/responses/compact",
+            true,
+            false,
+        ),
+        (Provider::Codex, Method::GET, "/models", false, true),
+        (Provider::Codex, Method::POST, "/v1/realtime", false, false),
+        (Provider::Codex, Method::POST, "/videos", false, false),
+        (Provider::Codex, Method::POST, "/v1/tunnel", false, false),
+    ] {
+        assert_eq!(
+            valid_endpoint(provider, &method, path, websocket),
+            expected,
+            "{provider} {method} {path}"
+        );
+    }
 }
 
 #[test]

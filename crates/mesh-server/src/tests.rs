@@ -195,7 +195,7 @@ async fn a_request_goes_over_the_tunnel_with_its_path_query_and_body() {
     let stub = Stub::new();
     stub.on(
         Method::POST,
-        "/relay/a/v1/items",
+        "/relay/a/responses",
         Reply::status(200)
             .header("x-mesh-headroom", "0.25")
             .header("x-upstream", "yes")
@@ -204,7 +204,7 @@ async fn a_request_goes_over_the_tunnel_with_its_path_query_and_body() {
     let state = relay_state(stub.router(), vec![account("a", 0.7)]).await;
     let addr = serve(state.clone()).await;
     let response = reqwest::Client::new()
-        .post(format!("http://{addr}/codex/v1/items?stream=true&q=a%2Fb"))
+        .post(format!("http://{addr}/codex/responses?stream=true&q=a%2Fb"))
         .header("x-kept", "1")
         .header("x-mesh-internal", "secret")
         .header("x-webauth-user", "mallory@example.com")
