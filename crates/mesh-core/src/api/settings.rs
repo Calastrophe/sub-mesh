@@ -16,6 +16,8 @@ pub const MAX_ACCESS_REQUESTS: usize = 100;
 
 pub const MAX_LOGIN_LEN: usize = 254;
 
+pub const MAX_WEB_BODY_BYTES: u64 = 134_217_728;
+
 const MAX_TAG_LEN: usize = 64;
 
 const TAGGED_LOGIN: &str = "tagged-devices";
@@ -75,15 +77,62 @@ impl FromStr for ListKind {
     }
 }
 
+#[must_use]
+pub fn is_format_char(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xAD | 0x600..=0x605
+            | 0x61C
+            | 0x6DD
+            | 0x70F
+            | 0x890..=0x891
+            | 0x8E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+pub fn check_note(note: &str) -> Result<Option<String>, String> {
+    let note = note.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
+    let note = note.trim();
+    if note.chars().count() > MAX_ACCESS_NOTE {
+        return Err(format!(
+            "the note is longer than {MAX_ACCESS_NOTE} characters"
+        ));
+    }
+    if note.chars().any(|c| c.is_control() || is_format_char(c)) {
+        return Err("the note cannot contain control or formatting characters".to_owned());
+    }
+    Ok((!note.is_empty()).then(|| note.to_owned()))
+}
+
 pub fn check_login(login: &str) -> Result<String, String> {
     let login = login.trim();
     if login.is_empty() {
         return Err("a login cannot be empty".to_owned());
     }
+    if login == "." || login == ".." {
+        return Err(format!("{login:?} is not a login"));
+    }
     if login.len() > MAX_LOGIN_LEN {
         return Err("the login is too long".to_owned());
     }
-    if login.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if login
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || is_format_char(c))
+    {
         return Err("a login cannot contain spaces or control characters".to_owned());
     }
     if login.eq_ignore_ascii_case(TAGGED_LOGIN) {
@@ -134,6 +183,9 @@ pub fn decision_path(login: &str, approve: bool) -> String {
 
 #[must_use]
 pub fn encode_segment(value: &str) -> String {
+    if value == "." || value == ".." {
+        return value.replace('.', "%2E");
+    }
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'@') {
@@ -209,7 +261,7 @@ impl SettingName {
             SettingName::CacheTtlSecs | SettingName::DaemonStaleSecs => (1.0, 86_400.0),
             SettingName::AffinityMinHeadroom => (0.0, 1.0),
             SettingName::MaxAttempts => (1.0, 10.0),
-            SettingName::MaxBodyBytes => (1_048_576.0, 536_870_912.0),
+            SettingName::MaxBodyBytes => (1_048_576.0, MAX_WEB_BODY_BYTES as f64),
             SettingName::ConsumersAllowLoopback | SettingName::DaemonsAllowLoopback => (0.0, 1.0),
         }
     }
@@ -432,6 +484,9 @@ mod tests {
             decision_path("vablings@github", true),
             "/api/v1/settings/requests/vablings@github/approve"
         );
+        assert_eq!(request_path(".."), "/api/v1/settings/requests/%2E%2E");
+        assert_eq!(request_path("."), "/api/v1/settings/requests/%2E");
+        assert_eq!(request_path("a.b"), "/api/v1/settings/requests/a.b");
         assert!(SETTINGS_PATH.starts_with(super::super::PREFIX));
     }
 
@@ -445,6 +500,10 @@ mod tests {
             "tagged-devices",
             "Tagged-Devices",
             "a\u{7}",
+            ".",
+            "..",
+            " .. ",
+            "a\u{202E}b",
         ] {
             assert!(check_login(bad).is_err(), "{bad:?}");
         }
@@ -453,6 +512,27 @@ mod tests {
         for bad in ["mesh", "tag:", "tag:1a", "tag:a b", "tag:a_b"] {
             assert!(check_tag(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn notes_are_one_plain_line() {
+        assert_eq!(check_note("  hi  "), Ok(Some("hi".to_owned())));
+        assert_eq!(check_note(" \n\t "), Ok(None));
+        assert_eq!(
+            check_note("line one\r\nline two\tend\n"),
+            Ok(Some("line one line two end".to_owned()))
+        );
+        for bad in [
+            "a\u{7}b",
+            "a\u{202E}b",
+            "a\u{200B}b",
+            "a\u{2066}b",
+            "a\u{FEFF}",
+        ] {
+            assert!(check_note(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_note(&"x".repeat(MAX_ACCESS_NOTE)).is_ok());
+        assert!(check_note(&"x".repeat(MAX_ACCESS_NOTE + 1)).is_err());
     }
 
     #[test]
@@ -484,6 +564,7 @@ mod tests {
             (SettingName::AffinityMinHeadroom, "1.5"),
             (SettingName::MaxAttempts, "11"),
             (SettingName::MaxBodyBytes, "10"),
+            (SettingName::MaxBodyBytes, "134217729"),
             (SettingName::DaemonsAllowLoopback, "1"),
         ] {
             assert!(check(name, json).is_err(), "{name} {json}");
