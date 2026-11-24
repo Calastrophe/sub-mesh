@@ -36,6 +36,53 @@ irm https://raw.githubusercontent.com/Calastrophe/sub-mesh/main/install.ps1 | ie
 Run `meshctl login codex` or `meshctl login claude`, then check
 `meshctl status`. Run the installer again to upgrade.
 
+## Configuration
+
+By default the server reads `/etc/mesh/server.toml`, and the daemon reads
+`~/.config/mesh/daemon.toml` on Linux (honoring `XDG_CONFIG_HOME`) and
+`%APPDATA%\mesh\daemon.toml` on Windows. Restart the service after a
+change.
+
+**Server**
+
+```toml
+[consumers]              # who may use the API and dashboard
+logins = ["you@example.com"]
+
+[daemons]                # who may connect daemons
+logins = ["you@example.com"]
+tags = ["tag:mesh"]
+```
+
+Empty `logins` means the server's own tailnet login.
+
+**Daemon**
+
+```toml
+server_url = "http://mesh-host:7070"
+
+[allowed_peers]          # which server to trust, http:// only
+logins = ["you@example.com"]
+```
+
+**Reverse proxy**
+
+To run the server behind a proxy that authenticates tailnet users, such as
+Caddy with `tailscale_auth`, add this to `server.toml`:
+
+```toml
+[trusted_proxy]
+addrs = ["10.0.0.5"]      # the address the proxy connects from
+header = "x-webauth-user" # the login header the proxy sets
+only = true               # refuse direct callers; no tailscaled needed
+```
+
+The server trusts the header from these addresses alone, so make sure only
+the proxy can reach the server. With `only`, set explicit `logins` in
+`[consumers]` and `[daemons]`. Point
+daemons at the proxy with an `https://` `server_url` and leave
+`[allowed_peers]` empty.
+
 ## Clients
 
 **Claude Code**

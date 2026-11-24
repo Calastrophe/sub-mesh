@@ -100,6 +100,17 @@ fn rejects_bad_config() {
     assert_eq!(https.server_url, "https://mesh.example.com");
     assert_eq!(https.server.port_or_known_default(), Some(443));
 
+    for peers in [
+        "logins = [\"a@example.com\"]",
+        "tags = [\"tag:mesh\"]",
+        "allow_loopback = true",
+    ] {
+        let config = parse(&format!(
+            "server_url = \"https://mesh.example.com\"\n[allowed_peers]\n{peers}"
+        ));
+        assert!(config.resolve(None, "h").is_err(), "{peers}");
+    }
+
     for url in [
         "ftp://s",
         "ws://s",

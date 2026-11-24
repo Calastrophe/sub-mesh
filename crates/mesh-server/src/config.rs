@@ -43,9 +43,10 @@ pub struct TrustedProxy {
     pub header: String,
     /// Every caller comes through the proxy, and the server host has no
     /// tailscaled: whois is never asked, and callers from other addresses
-    /// are refused (except loopback where `allow_loopback` allows it).
-    /// Needs `addrs` and explicit `logins` in `[consumers]` and `[daemons]`,
-    /// since the server cannot learn its own login.
+    /// are refused. Needs `addrs` and explicit `logins` in `[consumers]` and
+    /// `[daemons]`, since the server cannot learn its own login. Rules out
+    /// `allow_loopback` and `insecure_skip_whois`; a proxy on this host is
+    /// listed in `addrs` as a loopback address.
     pub only: bool,
 }
 
@@ -168,7 +169,16 @@ impl Config {
                 self.trusted_proxy.header
             );
         }
-        if self.trusted_proxy.only && !self.insecure_skip_whois {
+        if self.trusted_proxy.only {
+            if self.insecure_skip_whois {
+                bail!("trusted_proxy.only cannot be combined with insecure_skip_whois");
+            }
+            if self.consumers.allow_loopback || self.daemons.allow_loopback {
+                bail!(
+                    "trusted_proxy.only cannot be combined with allow_loopback: \
+                     list a proxy on this host in trusted_proxy.addrs instead"
+                );
+            }
             if self.trusted_proxy.addrs.is_empty() {
                 bail!("trusted_proxy.only needs trusted_proxy.addrs");
             }
@@ -374,6 +384,9 @@ mod tests {
             "[trusted_proxy]\nonly = true\n[consumers]\nlogins = [\"a\"]\n[daemons]\nlogins = [\"a\"]",
             "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[daemons]\nlogins = [\"a\"]",
             "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]",
+            "insecure_skip_whois = true\n[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]\n[daemons]\nlogins = [\"a\"]",
+            "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]\nallow_loopback = true\n[daemons]\nlogins = [\"a\"]",
+            "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]\n[daemons]\nlogins = [\"a\"]\nallow_loopback = true",
         ] {
             assert!(Config::from_toml(bad).is_err(), "{bad}");
         }

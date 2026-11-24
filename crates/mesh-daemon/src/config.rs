@@ -70,8 +70,9 @@ fn default_tailscale_socket() -> PathBuf {
 /// checks the tailnet identity of the host behind `server_url` before it
 /// opens its tunnel, and sends nothing to a host that fails the check.
 ///
-/// This applies to an `http://` `server_url` only. An `https://` server is
-/// identified by its TLS certificate for the URL's host instead.
+/// This applies to an `http://` `server_url` only, and must be left empty
+/// for an `https://` one, whose TLS certificate for the URL's host
+/// identifies the server instead.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PeerPolicy {
@@ -199,6 +200,15 @@ impl Config {
             || parsed.fragment().is_some()
         {
             bail!("server_url must be an http:// or https:// origin without credentials");
+        }
+        let peers = &self.allowed_peers;
+        if parsed.scheme() == "https"
+            && (!peers.logins.is_empty() || !peers.tags.is_empty() || peers.allow_loopback)
+        {
+            bail!(
+                "allowed_peers applies to an http:// server_url only: \
+                 an https:// server is identified by its TLS certificate"
+            );
         }
 
         let admin_listen = self

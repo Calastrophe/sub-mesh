@@ -681,13 +681,13 @@ mod tests {
     async fn a_proxy_only_server_never_asks_whois() {
         let checker = PeerChecker::new(&Config {
             tailscale_socket: "/nonexistent/tailscaled.sock".into(),
-            consumers: PeerPolicy {
-                allow_loopback: true,
-                ..friends()
-            },
+            consumers: friends(),
             daemons: friends(),
             trusted_proxy: crate::config::TrustedProxy {
-                addrs: vec!["10.10.10.111".parse().unwrap()],
+                addrs: vec![
+                    "10.10.10.111".parse().unwrap(),
+                    "127.0.0.2".parse().unwrap(),
+                ],
                 only: true,
                 ..Default::default()
             },
@@ -704,12 +704,11 @@ mod tests {
         };
         assert!(reason.contains("trusted_proxy.only"), "{reason}");
         let loopback: SocketAddr = "127.0.0.1:5555".parse().unwrap();
-        assert!(allowed(
-            &checker.check(loopback, &friend, Role::Consumer).await
-        ));
-        assert!(!allowed(
-            &checker.check(loopback, &friend, Role::Daemon).await
-        ));
+        let local_proxy: SocketAddr = "127.0.0.2:40000".parse().unwrap();
+        for role in [Role::Consumer, Role::Daemon] {
+            assert!(!allowed(&checker.check(loopback, &friend, role).await));
+            assert!(allowed(&checker.check(local_proxy, &friend, role).await));
+        }
         assert!(checker.cache.lock().unwrap().is_empty());
     }
 
