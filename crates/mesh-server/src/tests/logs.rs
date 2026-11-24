@@ -292,34 +292,18 @@ async fn a_claude_json_answer_is_logged_with_its_tokens() {
 }
 
 #[tokio::test]
-async fn answers_that_are_no_model_responses_report_no_tokens() {
+async fn unsupported_endpoints_are_rejected_before_they_can_be_counted() {
     let stub = Stub::new();
-    let body = serde_json::json!({"usage": {"input_tokens": 5, "output_tokens": 6}});
-    stub.on(Method::POST, "/relay/a/v1/items", Reply::json(200, &body));
-    stub.on(
-        Method::POST,
-        "/relay/a/responses",
-        Reply::status(200)
-            .header("content-type", "text/plain")
-            .body(CODEX_SSE),
-    );
     let state = relay_state(stub.router(), vec![account("a", 0.9)]).await;
     let addr = serve(state.clone()).await;
-    let client = reqwest::Client::new();
-    let other = client
-        .post(format!("http://{addr}/codex/v1/items"))
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/codex/v1/realtime"))
+        .json(&serde_json::json!({"model":"gpt-5"}))
         .send()
         .await
         .unwrap();
-    other.bytes().await.unwrap();
-    send_codex(addr, "{}").await.bytes().await.unwrap();
-
-    let entries = completed(&state, 2).await;
-    assert_eq!(entries.len(), 2);
-    for entry in &entries {
-        assert_eq!((entry.responses, entry.usage), (0, None), "{}", entry.path);
-        assert!(entry.duration_ms.is_some());
-    }
+    assert_eq!(response.status(), 404);
+    assert!(completed(&state, 1).await.is_empty());
 }
 
 #[tokio::test]

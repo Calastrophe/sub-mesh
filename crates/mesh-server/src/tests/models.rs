@@ -511,29 +511,8 @@ async fn a_changed_allowlist_makes_a_kept_list_stale() {
 }
 
 #[tokio::test]
-async fn other_requests_on_the_list_paths_are_relayed_as_usual() {
+async fn methods_and_subpaths_outside_the_model_list_endpoint_are_rejected() {
     let stub = Stub::new();
-    stub.on(
-        Method::POST,
-        "/relay/a/models",
-        Reply::status(200).body("posted"),
-    );
-    stub.on(
-        Method::GET,
-        "/relay/a/models/gpt-5",
-        Reply::status(200).body("one"),
-    );
-    stub.on(
-        Method::GET,
-        "/relay/a/v1/models",
-        Reply::status(200).body("unused"),
-    );
-    stub.on(
-        Method::GET,
-        "/relay/c/v1/models/claude-a",
-        Reply::status(200).body("claude one"),
-    );
-    stub.on(Method::HEAD, "/relay/a/models", Reply::status(200));
     let state = list_state(
         &stub,
         vec![codex("a", None), claude("c", None)],
@@ -541,37 +520,18 @@ async fn other_requests_on_the_list_paths_are_relayed_as_usual() {
     )
     .await;
     let addr = serve(state).await;
-    let client = reqwest::Client::new();
-
-    let posted = client
-        .post(format!("http://{addr}/codex/models"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(posted.text().await.unwrap(), "posted");
     assert_eq!(
-        get(addr, "/codex/models/gpt-5").await.text().await.unwrap(),
-        "one"
-    );
-    assert_eq!(
-        get(addr, "/claude/v1/models/claude-a")
+        reqwest::Client::new()
+            .post(format!("http://{addr}/codex/models"))
+            .send()
             .await
-            .text()
-            .await
-            .unwrap(),
-        "claude one"
+            .unwrap()
+            .status(),
+        404
     );
-    let head = client
-        .head(format!("http://{addr}/codex/models"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(head.status(), 200);
-    let methods: Vec<_> = stub.seen().into_iter().map(|seen| seen.method).collect();
-    assert_eq!(
-        methods,
-        [Method::POST, Method::GET, Method::GET, Method::HEAD]
-    );
+    assert_eq!(get(addr, "/codex/models/gpt-5").await.status(), 404);
+    assert_eq!(get(addr, "/claude/v1/models/claude-a").await.status(), 404);
+    assert!(stub.seen().is_empty());
 }
 
 #[tokio::test]

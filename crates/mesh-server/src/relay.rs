@@ -95,6 +95,27 @@ fn valid_relay_path(rest: &str) -> bool {
         })
 }
 
+fn valid_endpoint(
+    provider: Provider,
+    method: &axum::http::Method,
+    rest: &str,
+    websocket: bool,
+) -> bool {
+    match (provider, rest) {
+        (Provider::Claude, "/v1/messages") => *method == axum::http::Method::POST && !websocket,
+        (Provider::Claude, "/v1/models") => *method == axum::http::Method::GET && !websocket,
+        (Provider::Codex, "/responses") => {
+            (*method == axum::http::Method::POST && !websocket)
+                || (*method == axum::http::Method::GET && websocket)
+        }
+        (Provider::Codex, "/responses/compact") => {
+            *method == axum::http::Method::POST && !websocket
+        }
+        (Provider::Codex, "/models") => *method == axum::http::Method::GET && !websocket,
+        _ => false,
+    }
+}
+
 /// The path and query of `rest` on the daemon's relay route for `candidate`.
 fn relay_target(candidate: &Candidate, rest: &str, query: Option<&str>) -> String {
     let mut target = format!("{RELAY_PREFIX}/{}{rest}", candidate.id);
@@ -432,6 +453,10 @@ pub(crate) async fn relay_as(
     let rest = upstream_path(parts.uri.path(), provider);
     if !valid_relay_path(rest) {
         return (StatusCode::BAD_REQUEST, "invalid relay path\n").into_response();
+    }
+    let websocket = mesh_relay::is_websocket_upgrade(&parts.headers);
+    if !valid_endpoint(provider, &parts.method, rest, websocket) {
+        return (StatusCode::NOT_FOUND, "unsupported provider endpoint\n").into_response();
     }
     let query = parts.uri.query();
     let mut headers = mesh_relay::forward_request_headers(&parts.headers, MeshHeaders::Strip);
