@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use chrono::Utc;
-use mesh_core::api::{MAX_ACCESS_NOTE, RequestAccess, Session};
+use mesh_core::api::{RequestAccess, Session, check_login, check_note};
 
 use super::failure::ApiFailure;
 use crate::AppState;
@@ -26,6 +26,12 @@ async fn build(state: &Arc<AppState>, caller: Caller) -> Result<Session, ApiFail
         .run(move |db| {
             let request = match (&login, consumer) {
                 (Some(login), false) => db.access_request(login)?,
+                (Some(login), true) => {
+                    if db.access_request(login)?.is_some() && db.forget_request(login)? {
+                        tracing::info!(%login, "removed the access request of a consumer");
+                    }
+                    None
+                }
                 _ => None,
             };
             let pending = if admin {
@@ -55,21 +61,10 @@ pub async fn session(
 }
 
 fn note(note: Option<String>) -> Result<Option<String>, ApiFailure> {
-    let Some(note) = note else {
-        return Ok(None);
-    };
-    let note = note.trim();
-    if note.chars().count() > MAX_ACCESS_NOTE {
-        return Err(ApiFailure::bad_request(format!(
-            "the note is longer than {MAX_ACCESS_NOTE} characters"
-        )));
+    match note {
+        Some(note) => check_note(&note).map_err(ApiFailure::bad_request),
+        None => Ok(None),
     }
-    if note.chars().any(char::is_control) {
-        return Err(ApiFailure::bad_request(
-            "the note cannot contain control characters",
-        ));
-    }
-    Ok((!note.is_empty()).then(|| note.to_owned()))
 }
 
 pub async fn request_access(
@@ -86,6 +81,9 @@ pub async fn request_access(
     let Some(login) = caller.peer.login.clone() else {
         return Err(ApiFailure::forbidden("access needs a tailnet login"));
     };
+    let login = check_login(&login).map_err(|reason| {
+        ApiFailure::forbidden(format!("{login:?} cannot be given access: {reason}"))
+    })?;
     let body: RequestAccess = if body.is_empty() {
         RequestAccess::default()
     } else {

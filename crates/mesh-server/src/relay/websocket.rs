@@ -39,13 +39,15 @@ use mesh_core::api::Transport;
 use mesh_core::protocol::{DENIED_HEADER, MODEL_HEADER};
 use mesh_relay::{FrameHooks, MeshHeaders, UpstreamSocket};
 use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 
 use super::http::MODELS_ETAG;
 use super::usage::Tally;
 use super::{Job, Run, affinity, headroom_hint, refused_for_model, relay_target};
 use crate::AppState;
-use crate::peer::Peer;
+use crate::peer::{Grant, Peer, Role};
 use crate::registry::{Candidate, InFlightGuard};
+use crate::settings::Effective;
 
 /// How long the server waits for the client's first message after the
 /// upgrade. Codex sends it at once.
@@ -62,8 +64,9 @@ const METADATA_EVENT_START: &str = r#"{"type":"codex.response.metadata""#;
 /// Accept the upgrade, then route the socket by its first message.
 pub(super) fn relay(
     state: Arc<AppState>,
+    tuning: Arc<Effective>,
     provider: Provider,
-    peer: Peer,
+    (peer, grant): (Peer, Grant),
     session: Option<String>,
     job: &Job<'_>,
     upgrade: WebSocketUpgrade,
@@ -79,13 +82,22 @@ pub(super) fn relay(
             rest: &rest,
             query: query.as_deref(),
         };
-        let run = Run::new(&state, provider, peer, session, Transport::Websocket, &job);
-        serve(run, &job, client).await;
+        let run = Run::new(
+            &state,
+            tuning,
+            provider,
+            peer,
+            session,
+            Transport::Websocket,
+            &job,
+        );
+        serve(run, &job, client, &grant).await;
     })
 }
 
 /// Route and relay one accepted socket.
-async fn serve(mut run: Run<'_>, job: &Job<'_>, mut client: WebSocket) {
+async fn serve(mut run: Run<'_>, job: &Job<'_>, mut client: WebSocket, grant: &Grant) {
+    let mut changes = run.state.peers.changes();
     let Some(first) = first_message(&mut client, FIRST_MESSAGE_TIMEOUT).await else {
         return;
     };
@@ -110,13 +122,27 @@ async fn serve(mut run: Run<'_>, job: &Job<'_>, mut client: WebSocket) {
         .log(Some(&candidate), StatusCode::SWITCHING_PROTOCOLS, hint)
         .await;
     let tally = Arc::new(Mutex::new(Tally::new(run.provider)));
-    socket
-        .relay(client, hooks(run.provider, tally.clone()))
-        .await;
+    tokio::select! {
+        () = socket.relay(client, hooks(run.provider, tally.clone())) => {}
+        () = revoked(run.state, grant, &mut changes) => {
+            tracing::info!(user = %run.peer.user(), "closing the WebSocket of a consumer who lost access");
+        }
+    }
     if let Some(entry) = entry {
         entry.complete(tally.lock().expect("tally mutex poisoned").completion());
     }
     drop(guard);
+}
+
+async fn revoked(state: &AppState, grant: &Grant, changes: &mut watch::Receiver<u64>) {
+    loop {
+        if !state.peers.admits(grant, Role::Consumer) {
+            return;
+        }
+        if changes.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// The client's first data message. `None` when the client closes, fails,

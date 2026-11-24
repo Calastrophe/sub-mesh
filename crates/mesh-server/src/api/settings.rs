@@ -48,31 +48,54 @@ async fn run(
     admin: &Peer,
     change: Option<Change>,
 ) -> Result<Json<SettingsView>, ApiFailure> {
-    if let Some(change) = &change {
-        tracing::info!(admin = ?admin.login, ?change, "settings change");
+    let Some(change) = change else {
+        let requests = state
+            .db
+            .run(|db| db.access_requests())
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "cannot read access requests");
+                ApiFailure::internal("cannot read the settings")
+            })?;
+        let snapshot = state.settings.snapshot();
+        return Ok(Json(settings::view(&state.config, &snapshot, requests)));
+    };
+    if state.peers.skips_whois() {
+        return Err(ApiFailure::forbidden(
+            "settings cannot change while insecure_skip_whois is on",
+        ));
     }
+    tracing::info!(admin = ?admin.login, ?change, "settings change");
     let shared = state.clone();
     let by = admin.login.clone();
     let outcome = state
         .db
         .run(move |db| {
-            let mut current = shared.settings.lock();
-            let result = match change {
-                Some(change) => settings::apply(
-                    &shared.config,
-                    db,
-                    &mut current,
-                    change,
-                    by.as_deref(),
-                    Utc::now(),
-                )?,
-                None => Ok(false),
-            };
-            if result == Ok(true) {
-                shared.install(&current.effective);
+            let result = shared.settings.change(
+                &shared.config,
+                db,
+                change,
+                by.as_deref(),
+                Utc::now(),
+                |effective| shared.install(effective),
+            )?;
+            if let Ok((true, _)) = &result {
+                let dropped = shared.revoke_daemons();
+                if !dropped.is_empty()
+                    && let Err(error) = db.forget_daemons(&dropped)
+                {
+                    tracing::warn!(%error, "cannot delete the daemons that lost access");
+                }
             }
-            let requests = db.access_requests()?;
-            Ok(result.map(|_| settings::view(&shared.config, &current, requests)))
+            let result = result.map(|(_, snapshot)| snapshot);
+            let requests = match &result {
+                Ok(_) => db.access_requests().unwrap_or_else(|error| {
+                    tracing::warn!(%error, "cannot read access requests after a settings change");
+                    Vec::new()
+                }),
+                Err(_) => Vec::new(),
+            };
+            Ok(result.map(|snapshot| settings::view(&shared.config, &snapshot, requests)))
         })
         .await
         .map_err(|error| {
@@ -80,6 +103,13 @@ async fn run(
             ApiFailure::internal("cannot store the settings")
         })?;
     outcome.map(Json).map_err(refusal)
+}
+
+fn trimmed(value: String) -> String {
+    match value.trim() {
+        trimmed if trimmed.len() == value.len() => value,
+        trimmed => trimmed.to_owned(),
+    }
 }
 
 fn kind(kind: &str) -> Result<ListKind, ApiFailure> {
@@ -106,6 +136,7 @@ async fn entry(
     add: bool,
 ) -> Result<Json<SettingsView>, ApiFailure> {
     let list = kind(list)?;
+    let value = trimmed(value);
     let change = if add {
         Change::Add(group, list, value)
     } else {
@@ -172,7 +203,7 @@ pub async fn approve(
     Admin(admin): Admin,
     Path(login): Path<String>,
 ) -> Result<Json<SettingsView>, ApiFailure> {
-    run(&state, &admin, Some(Change::Approve(login))).await
+    run(&state, &admin, Some(Change::Approve(trimmed(login)))).await
 }
 
 pub async fn deny(
@@ -180,7 +211,7 @@ pub async fn deny(
     Admin(admin): Admin,
     Path(login): Path<String>,
 ) -> Result<Json<SettingsView>, ApiFailure> {
-    run(&state, &admin, Some(Change::Deny(login))).await
+    run(&state, &admin, Some(Change::Deny(trimmed(login)))).await
 }
 
 pub async fn forget(
@@ -188,5 +219,5 @@ pub async fn forget(
     Admin(admin): Admin,
     Path(login): Path<String>,
 ) -> Result<Json<SettingsView>, ApiFailure> {
-    run(&state, &admin, Some(Change::Forget(login))).await
+    run(&state, &admin, Some(Change::Forget(trimmed(login)))).await
 }

@@ -75,7 +75,7 @@ pub struct AppState {
     /// The connection of each daemon's current tunnel, with its generation.
     /// The registry decides which generation is current; see
     /// [`AppState::attach_tunnel`].
-    clients: Mutex<HashMap<String, (u64, mesh_relay::tunnel::Client)>>,
+    clients: Mutex<HashMap<String, tunnel::Tunnel>>,
     /// The merged model lists that the server has answered clients with.
     model_lists: relay::ModelLists,
 }
@@ -87,7 +87,8 @@ impl AppState {
         registry: Registry,
         model_lists: relay::ModelLists,
     ) -> anyhow::Result<Arc<AppState>> {
-        let settings = Settings::load(&config, &db).context("cannot load web-managed settings")?;
+        let settings =
+            Settings::load(&config, &db, Utc::now()).context("cannot load web-managed settings")?;
         let state = AppState {
             peers: PeerChecker::new(&config),
             settings,
@@ -211,6 +212,10 @@ async fn maintain(state: Arc<AppState>) {
             match state.db.run(move |db| db.prune_requests(cutoff)).await {
                 Ok(count) => tracing::debug!(count, "pruned old request log rows"),
                 Err(error) => tracing::warn!(%error, "cannot prune request logs"),
+            }
+            let cutoff = now - settings::DENIED_RETENTION;
+            if let Err(error) = state.db.run(move |db| db.expire_denied(cutoff)).await {
+                tracing::warn!(%error, "cannot expire denied access requests");
             }
         }
         ticks += 1;

@@ -143,7 +143,12 @@ async fn connect_alice(state: &Arc<AppState>, stub: &Arc<Stub>) {
                 axum::routing::get(
                     |axum::extract::State(state): axum::extract::State<Arc<AppState>>,
                      request: Request| async {
-                        crate::tunnel::connect(state, Some(ALICE.to_owned()), request)
+                        crate::tunnel::connect(
+                            state,
+                            Some(ALICE.to_owned()),
+                            crate::peer::Grant::Open,
+                            request,
+                        )
                     },
                 ),
             )

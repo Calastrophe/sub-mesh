@@ -683,6 +683,7 @@ async fn relay_codex(state: &Arc<AppState>, request: Request) -> Response {
         state,
         Provider::Codex,
         Peer::anonymous("test"),
+        crate::peer::Grant::Open,
         upgrade,
         Request::from_parts(parts, body),
     )
@@ -961,7 +962,15 @@ async fn relay_as_header(
         node: "test-node".to_owned(),
         login,
     };
-    relay::relay_as(&state, provider, peer, upgrade, request).await
+    relay::relay_as(
+        &state,
+        provider,
+        peer,
+        crate::peer::Grant::Open,
+        upgrade,
+        request,
+    )
+    .await
 }
 
 async fn serve_with_identity(state: Arc<AppState>) -> SocketAddr {

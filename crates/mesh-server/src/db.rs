@@ -115,6 +115,17 @@ impl Db {
         Ok(())
     }
 
+    pub fn forget_daemons(&self, nodes: &[String]) -> anyhow::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for node in nodes {
+            tx.execute("DELETE FROM accounts WHERE node = ?1", [node])?;
+            tx.execute("DELETE FROM daemons WHERE node = ?1", [node])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Read back every daemon and account. Rows that no longer parse are
     /// skipped with a warning.
     pub fn load(&self) -> anyhow::Result<Loaded> {

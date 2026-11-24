@@ -1,14 +1,14 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mesh_core::api::{
     AccessList, AccessRequest, EntrySource, FixedSettings, ListEntry, ListGroup, ListKind,
-    ProxyInfo, SettingName, SettingValue, SettingsView, Tunable,
+    MAX_WEB_BODY_BYTES, ProxyInfo, SettingName, SettingValue, SettingsView, Tunable,
 };
 
 use crate::config::{Config, PeerPolicy};
 use crate::db::{Db, StoredEntry, StoredSettings, StoredValue};
-use crate::peer::{Policies, merge_logins};
+use crate::peer::{Policies, merge_logins, merge_tags};
 
 #[derive(Clone, Debug)]
 pub struct Effective {
@@ -23,14 +23,17 @@ impl Effective {
 }
 
 #[derive(Debug)]
-pub struct Current {
+pub struct Snapshot {
     pub stored: StoredSettings,
     pub effective: Arc<Effective>,
 }
 
 pub struct Settings {
-    current: Mutex<Current>,
+    snapshot: RwLock<Arc<Snapshot>>,
+    writer: Mutex<()>,
 }
+
+pub const DENIED_RETENTION: TimeDelta = TimeDelta::days(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -51,12 +54,35 @@ fn value_of(config: &Config, name: SettingName) -> SettingValue {
     }
 }
 
+pub fn check_value(
+    config: &Config,
+    name: SettingName,
+    value: SettingValue,
+) -> Result<SettingValue, String> {
+    if name == SettingName::MaxBodyBytes {
+        let ceiling = (config.max_body_bytes as u64).max(MAX_WEB_BODY_BYTES);
+        let number = value.as_f64();
+        let whole = !matches!(value, SettingValue::Flag(_)) && number.fract() == 0.0;
+        if whole && number > MAX_WEB_BODY_BYTES as f64 && number <= ceiling as f64 {
+            return Ok(SettingValue::Whole(number as u64));
+        }
+        if number > ceiling as f64 {
+            return Err(format!(
+                "{name} must be between {} and {ceiling}",
+                name.bounds().0
+            ));
+        }
+    }
+    name.check(value)
+}
+
 fn override_value(
+    base: &Config,
     config: &mut Config,
     name: SettingName,
     value: SettingValue,
 ) -> Result<(), String> {
-    let value = name.check(value)?;
+    let value = check_value(base, name, value)?;
     let whole = || match value {
         SettingValue::Whole(whole) => Ok(whole),
         _ => Err(format!("{name} is a whole number")),
@@ -93,13 +119,20 @@ fn policy_of(config: &Config, group: ListGroup) -> &PeerPolicy {
     }
 }
 
+pub fn same_value(kind: ListKind, known: &str, value: &str) -> bool {
+    match kind {
+        ListKind::Logins => known.eq_ignore_ascii_case(value),
+        ListKind::Tags => known == value,
+    }
+}
+
 fn baseline(config: &Config, group: ListGroup, kind: ListKind) -> Vec<(String, EntrySource)> {
     let policy = policy_of(config, group);
     let mut entries: Vec<(String, EntrySource)> = Vec::new();
     let mut push = |value: &String, source| {
         if !entries
             .iter()
-            .any(|(known, _)| known.eq_ignore_ascii_case(value))
+            .any(|(known, _)| same_value(kind, known, value))
         {
             entries.push((value.clone(), source));
         }
@@ -127,17 +160,17 @@ fn baseline(config: &Config, group: ListGroup, kind: ListKind) -> Vec<(String, E
 fn in_baseline(config: &Config, group: ListGroup, kind: ListKind, value: &str) -> bool {
     baseline(config, group, kind)
         .iter()
-        .any(|(known, _)| known.eq_ignore_ascii_case(value))
+        .any(|(known, _)| same_value(kind, known, value))
 }
 
 fn same_entry(entry: &StoredEntry, group: ListGroup, kind: ListKind, value: &str) -> bool {
-    entry.group == group && entry.kind == kind && entry.value.eq_ignore_ascii_case(value)
+    entry.group == group && entry.kind == kind && same_value(kind, &entry.value, value)
 }
 
 pub fn compute(config: &Config, stored: &StoredSettings) -> Result<Effective, String> {
     let mut effective = config.clone();
     for value in &stored.values {
-        override_value(&mut effective, value.name, value.value)?;
+        override_value(config, &mut effective, value.name, value.value)?;
     }
     effective
         .validate_settings()
@@ -145,11 +178,11 @@ pub fn compute(config: &Config, stored: &StoredSettings) -> Result<Effective, St
     let mut policies = Policies::from_config(&effective);
     for entry in &stored.entries {
         let policy = policy_mut(&mut policies, entry.group);
-        let list = match entry.kind {
-            ListKind::Logins => &mut policy.logins,
-            ListKind::Tags => &mut policy.tags,
-        };
-        merge_logins(list, std::slice::from_ref(&entry.value));
+        let more = std::slice::from_ref(&entry.value);
+        match entry.kind {
+            ListKind::Logins => merge_logins(&mut policy.logins, more),
+            ListKind::Tags => merge_tags(&mut policy.tags, more),
+        }
     }
     Ok(Effective {
         config: effective,
@@ -158,42 +191,96 @@ pub fn compute(config: &Config, stored: &StoredSettings) -> Result<Effective, St
 }
 
 impl Settings {
-    pub fn load(config: &Config, db: &Db) -> anyhow::Result<Settings> {
+    pub fn load(config: &Config, db: &Db, now: DateTime<Utc>) -> anyhow::Result<Settings> {
         let loaded = db.load_settings()?;
         let mut stored = StoredSettings::default();
         for entry in loaded.entries {
             match entry.kind.check(&entry.value) {
-                Ok(_) if !in_baseline(config, entry.group, entry.kind, &entry.value) => {
+                Ok(value)
+                    if value == entry.value
+                        && !in_baseline(config, entry.group, entry.kind, &entry.value) =>
+                {
                     stored.entries.push(entry);
                 }
-                Ok(_) => {}
+                Ok(_) if in_baseline(config, entry.group, entry.kind, &entry.value) => {
+                    tracing::info!(
+                        list = %format!("{}.{}", entry.group.as_str(), entry.kind.as_str()),
+                        value = %entry.value,
+                        "removing a web-managed entry that the server config now lists"
+                    );
+                    db.delete_entry(&entry)?;
+                }
+                Ok(_) => {
+                    tracing::warn!(value = %entry.value, "removing an unnormalized stored access entry");
+                    db.delete_entry(&entry)?;
+                }
                 Err(reason) => {
-                    tracing::warn!(value = %entry.value, %reason, "ignoring stored access entry");
+                    tracing::warn!(value = %entry.value, %reason, "removing an invalid stored access entry");
+                    db.delete_entry(&entry)?;
                 }
             }
         }
         for value in loaded.values {
             stored.values.push(value.clone());
             if let Err(reason) = compute(config, &stored) {
-                tracing::warn!(name = %value.name, %reason, "ignoring stored setting override");
+                tracing::warn!(name = %value.name, %reason, "removing an invalid stored setting override");
                 stored.values.pop();
+                db.remove_override(value.name)?;
             }
         }
         let effective = compute(config, &stored).map_err(anyhow::Error::msg)?;
+        let consumers = db.forget_requests_of(&effective.policies.consumers.logins)?;
+        if consumers > 0 {
+            tracing::info!(
+                count = consumers,
+                "removed access requests of logins that are consumers"
+            );
+        }
+        db.expire_denied(now - DENIED_RETENTION)?;
         Ok(Settings {
-            current: Mutex::new(Current {
+            snapshot: RwLock::new(Arc::new(Snapshot {
                 stored,
                 effective: Arc::new(effective),
-            }),
+            })),
+            writer: Mutex::new(()),
         })
     }
 
-    pub fn effective(&self) -> Arc<Effective> {
-        self.lock().effective.clone()
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.snapshot
+            .read()
+            .expect("settings lock poisoned")
+            .clone()
     }
 
-    pub fn lock(&self) -> std::sync::MutexGuard<'_, Current> {
-        self.current.lock().expect("settings mutex poisoned")
+    pub fn effective(&self) -> Arc<Effective> {
+        self.snapshot().effective.clone()
+    }
+
+    pub fn change(
+        &self,
+        config: &Config,
+        db: &Db,
+        change: Change,
+        by: Option<&str>,
+        now: DateTime<Utc>,
+        install: impl FnOnce(&Effective),
+    ) -> anyhow::Result<Result<(bool, Arc<Snapshot>), Refusal>> {
+        let _writer = self.writer.lock().expect("settings writer poisoned");
+        let current = self.snapshot();
+        match apply(config, db, &current.stored, change, by, now)? {
+            Err(refusal) => Ok(Err(refusal)),
+            Ok(None) => Ok(Ok((false, current))),
+            Ok(Some((stored, effective))) => {
+                let snapshot = Arc::new(Snapshot {
+                    stored,
+                    effective: Arc::new(effective),
+                });
+                *self.snapshot.write().expect("settings lock poisoned") = snapshot.clone();
+                install(&snapshot.effective);
+                Ok(Ok((true, snapshot)))
+            }
+        }
     }
 }
 
@@ -208,16 +295,29 @@ pub enum Change {
     Forget(String),
 }
 
+type Applied = Option<(StoredSettings, Effective)>;
+
+fn computed(config: &Config, stored: StoredSettings) -> Result<Applied, Refusal> {
+    match compute(config, &stored) {
+        Ok(effective) => Ok(Some((stored, effective))),
+        Err(reason) => Err(Refusal::Invalid(reason)),
+    }
+}
+
+fn no_request(login: &str) -> Refusal {
+    Refusal::Missing(format!("no access request from {login}"))
+}
+
 pub fn apply(
     config: &Config,
     db: &Db,
-    current: &mut Current,
+    current: &StoredSettings,
     change: Change,
     by: Option<&str>,
     now: DateTime<Utc>,
-) -> anyhow::Result<Result<bool, Refusal>> {
+) -> anyhow::Result<Result<Applied, Refusal>> {
     let by = by.map(str::to_owned);
-    let mut stored = current.stored.clone();
+    let mut stored = current.clone();
     match change {
         Change::Add(group, kind, value) => {
             let value = match kind.check(&value) {
@@ -233,7 +333,7 @@ pub fn apply(
                 if (group, kind) == (ListGroup::Consumers, ListKind::Logins) {
                     db.forget_request(&value)?;
                 }
-                return Ok(Ok(false));
+                return Ok(Ok(None));
             }
             let entry = StoredEntry {
                 group,
@@ -243,13 +343,11 @@ pub fn apply(
                 added_at: now,
             };
             stored.entries.push(entry.clone());
-            let effective = match compute(config, &stored) {
-                Ok(effective) => effective,
-                Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
-            };
-            db.add_entry(&entry)?;
-            current.stored = stored;
-            current.effective = Arc::new(effective);
+            let applied = computed(config, stored);
+            if applied.is_ok() {
+                db.add_entry(&entry)?;
+            }
+            Ok(applied)
         }
         Change::Remove(group, kind, value) => {
             if in_baseline(config, group, kind, &value) {
@@ -257,23 +355,25 @@ pub fn apply(
                     "{value} comes from the server config"
                 ))));
             }
-            let before = stored.entries.len();
+            let Some(removed) = stored
+                .entries
+                .iter()
+                .find(|entry| same_entry(entry, group, kind, &value))
+                .cloned()
+            else {
+                return Ok(Err(Refusal::Missing(format!("{value} is not listed"))));
+            };
             stored
                 .entries
                 .retain(|entry| !same_entry(entry, group, kind, &value));
-            if stored.entries.len() == before {
-                return Ok(Err(Refusal::Missing(format!("{value} is not listed"))));
+            let applied = computed(config, stored);
+            if applied.is_ok() {
+                db.delete_entry(&removed)?;
             }
-            let effective = match compute(config, &stored) {
-                Ok(effective) => effective,
-                Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
-            };
-            db.remove_entry(group, kind, &value)?;
-            current.stored = stored;
-            current.effective = Arc::new(effective);
+            Ok(applied)
         }
         Change::Set(name, value) => {
-            let value = match name.check(value) {
+            let value = match check_value(config, name, value) {
                 Ok(value) => value,
                 Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
             };
@@ -285,79 +385,65 @@ pub fn apply(
             };
             stored.values.retain(|known| known.name != name);
             stored.values.push(stored_value.clone());
-            let effective = match compute(config, &stored) {
-                Ok(effective) => effective,
-                Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
-            };
-            db.set_override(&stored_value)?;
-            current.stored = stored;
-            current.effective = Arc::new(effective);
+            let applied = computed(config, stored);
+            if applied.is_ok() {
+                db.set_override(&stored_value)?;
+            }
+            Ok(applied)
         }
         Change::Reset(name) => {
             stored.values.retain(|known| known.name != name);
-            let effective = match compute(config, &stored) {
-                Ok(effective) => effective,
-                Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
-            };
-            db.remove_override(name)?;
-            current.stored = stored;
-            current.effective = Arc::new(effective);
+            let applied = computed(config, stored);
+            if applied.is_ok() {
+                db.remove_override(name)?;
+            }
+            Ok(applied)
         }
         Change::Approve(login) => {
+            let login = match ListKind::Logins.check(&login) {
+                Ok(login) => login,
+                Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
+            };
             let known = in_baseline(config, ListGroup::Consumers, ListKind::Logins, &login)
                 || stored
                     .entries
                     .iter()
                     .any(|entry| same_entry(entry, ListGroup::Consumers, ListKind::Logins, &login));
-            let entry = match ListKind::Logins.check(&login) {
-                Ok(login) if !known => Some(StoredEntry {
-                    group: ListGroup::Consumers,
-                    kind: ListKind::Logins,
-                    value: login,
-                    added_by: by,
-                    added_at: now,
-                }),
-                Ok(_) => None,
-                Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
+            if known {
+                return Ok(if db.forget_request(&login)? {
+                    Ok(None)
+                } else {
+                    Err(no_request(&login))
+                });
+            }
+            let entry = StoredEntry {
+                group: ListGroup::Consumers,
+                kind: ListKind::Logins,
+                value: login.clone(),
+                added_by: by,
+                added_at: now,
             };
-            let mut effective = None;
-            if let Some(entry) = &entry {
-                stored.entries.push(entry.clone());
-                match compute(config, &stored) {
-                    Ok(computed) => effective = Some(computed),
-                    Err(reason) => return Ok(Err(Refusal::Invalid(reason))),
-                }
+            stored.entries.push(entry.clone());
+            let applied = match computed(config, stored) {
+                Ok(applied) => applied,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+            if !db.approve_request(&login, Some(&entry))? {
+                return Ok(Err(no_request(&login)));
             }
-            if !db.approve_request(&login, entry.as_ref())? {
-                return Ok(Err(Refusal::Missing(format!(
-                    "no access request from {login}"
-                ))));
-            }
-            if let Some(effective) = effective {
-                current.stored = stored;
-                current.effective = Arc::new(effective);
-                return Ok(Ok(true));
-            }
-            return Ok(Ok(false));
+            Ok(Ok(applied))
         }
-        Change::Deny(login) => {
-            if !db.deny_request(&login, by.as_deref(), now)? {
-                return Ok(Err(Refusal::Missing(format!(
-                    "no access request from {login}"
-                ))));
-            }
-            return Ok(Ok(false));
-        }
-        Change::Forget(login) => {
-            if !db.forget_request(&login)? {
-                return Ok(Err(Refusal::Missing(format!(
-                    "no access request from {login}"
-                ))));
-            }
-            return Ok(Ok(false));
-        }
+        Change::Deny(login) => Ok(if db.deny_request(&login, by.as_deref(), now)? {
+            Ok(None)
+        } else {
+            Err(no_request(&login))
+        }),
+        Change::Forget(login) => Ok(if db.forget_request(&login)? {
+            Ok(None)
+        } else {
+            Err(no_request(&login))
+        }),
     }
-    Ok(Ok(true))
 }
 
 fn entries(
@@ -380,7 +466,7 @@ fn entries(
             && entry.kind == kind
             && !list
                 .iter()
-                .any(|known| known.value.eq_ignore_ascii_case(&entry.value))
+                .any(|known| same_value(kind, &known.value, &entry.value))
         {
             list.push(ListEntry {
                 value: entry.value.clone(),
@@ -418,7 +504,7 @@ fn fixed(config: &Config) -> FixedSettings {
     }
 }
 
-pub fn view(config: &Config, current: &Current, requests: Vec<AccessRequest>) -> SettingsView {
+pub fn view(config: &Config, current: &Snapshot, requests: Vec<AccessRequest>) -> SettingsView {
     let values = SettingName::ALL
         .into_iter()
         .map(|name| {
@@ -481,22 +567,24 @@ mod tests {
     fn change(
         config: &Config,
         db: &Db,
-        current: &mut Current,
+        settings: &Settings,
         change: Change,
     ) -> Result<bool, Refusal> {
-        apply(config, db, current, change, Some("root@example.com"), t0()).unwrap()
+        settings
+            .change(config, db, change, Some("root@example.com"), t0(), |_| {})
+            .unwrap()
+            .map(|(changed, _)| changed)
     }
 
     #[test]
     fn effective_settings_keep_the_proxy_only_rules() {
         let config = proxy_only();
         let db = Db::open_in_memory().unwrap();
-        let settings = Settings::load(&config, &db).unwrap();
-        let mut current = settings.lock();
+        let settings = Settings::load(&config, &db, t0()).unwrap();
         let refused = change(
             &config,
             &db,
-            &mut current,
+            &settings,
             Change::Set(
                 SettingName::ConsumersAllowLoopback,
                 SettingValue::Flag(true),
@@ -505,13 +593,13 @@ mod tests {
         assert!(
             matches!(refused, Err(Refusal::Invalid(reason)) if reason.contains("allow_loopback"))
         );
-        assert!(!current.effective.config.consumers.allow_loopback);
+        assert!(!settings.effective().config.consumers.allow_loopback);
         assert!(db.load_settings().unwrap().values.is_empty());
         assert_eq!(
             change(
                 &config,
                 &db,
-                &mut current,
+                &settings,
                 Change::Set(SettingName::DaemonsAllowLoopback, SettingValue::Flag(false)),
             ),
             Ok(true)
@@ -522,11 +610,10 @@ mod tests {
     fn admins_are_consumers_and_the_baseline_stays() {
         let config = proxy_only();
         let db = Db::open_in_memory().unwrap();
-        let settings = Settings::load(&config, &db).unwrap();
-        let mut current = settings.lock();
+        let settings = Settings::load(&config, &db, t0()).unwrap();
         assert!(
-            current
-                .effective
+            settings
+                .effective()
                 .policies
                 .consumers
                 .logins
@@ -537,7 +624,7 @@ mod tests {
                 change(
                     &config,
                     &db,
-                    &mut current,
+                    &settings,
                     Change::Remove(ListGroup::Consumers, ListKind::Logins, login.to_owned()),
                 ),
                 Err(Refusal::Fixed(_))
@@ -547,7 +634,7 @@ mod tests {
             change(
                 &config,
                 &db,
-                &mut current,
+                &settings,
                 Change::Add(
                     ListGroup::Consumers,
                     ListKind::Logins,
@@ -560,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_stored_overrides_are_ignored_at_load() {
+    fn bad_stored_overrides_are_removed_at_load() {
         let db = Db::open_in_memory().unwrap();
         db.set_override(&StoredValue {
             name: SettingName::ConsumersAllowLoopback,
@@ -577,18 +664,175 @@ mod tests {
         })
         .unwrap();
         let config = proxy_only();
-        let settings = Settings::load(&config, &db).unwrap();
+        let settings = Settings::load(&config, &db, t0()).unwrap();
         let effective = settings.effective();
         assert!(!effective.config.consumers.allow_loopback);
         assert_eq!(effective.config.max_attempts, 5);
+        let names: Vec<_> = db
+            .load_settings()
+            .unwrap()
+            .values
+            .into_iter()
+            .map(|value| value.name)
+            .collect();
+        assert_eq!(names, [SettingName::MaxAttempts]);
         let open = Settings::load(
             &Config {
                 web_dir: None,
                 ..Config::default()
             },
             &db,
+            t0(),
         )
         .unwrap();
-        assert!(open.effective().config.consumers.allow_loopback);
+        assert!(!open.effective().config.consumers.allow_loopback);
+        assert_eq!(open.effective().config.max_attempts, 5);
+    }
+
+    #[test]
+    fn web_entries_that_the_config_now_lists_are_removed_at_load() {
+        let db = Db::open_in_memory().unwrap();
+        for (group, kind, value) in [
+            (ListGroup::Consumers, ListKind::Logins, "A@example.com"),
+            (ListGroup::Consumers, ListKind::Logins, "Root@example.com"),
+            (ListGroup::Consumers, ListKind::Logins, "bob@example.com"),
+            (ListGroup::Daemons, ListKind::Tags, "tag:mesh"),
+        ] {
+            db.add_entry(&StoredEntry {
+                group,
+                kind,
+                value: value.to_owned(),
+                added_by: None,
+                added_at: t0(),
+            })
+            .unwrap();
+        }
+        let config = Config {
+            daemons: PeerPolicy {
+                logins: vec!["a@example.com".to_owned()],
+                tags: vec!["tag:Mesh".to_owned()],
+                ..PeerPolicy::default()
+            },
+            ..proxy_only()
+        };
+        let settings = Settings::load(&config, &db, t0()).unwrap();
+        let kept: Vec<_> = db
+            .load_settings()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect();
+        assert_eq!(kept, ["bob@example.com", "tag:mesh"]);
+        assert_eq!(settings.snapshot().stored.entries.len(), 2);
+        let without = Settings::load(
+            &Config {
+                consumers: PeerPolicy {
+                    logins: vec!["c@example.com".to_owned()],
+                    ..PeerPolicy::default()
+                },
+                admins: Admins::default(),
+                ..proxy_only()
+            },
+            &db,
+            t0(),
+        )
+        .unwrap();
+        let consumers = &without.effective().policies.consumers.logins;
+        assert!(
+            !consumers
+                .iter()
+                .any(|login| login.eq_ignore_ascii_case("a@example.com"))
+        );
+        assert!(
+            !consumers
+                .iter()
+                .any(|login| login.eq_ignore_ascii_case("root@example.com"))
+        );
+    }
+
+    #[test]
+    fn readers_see_the_new_settings_while_a_change_is_still_open() {
+        let config = proxy_only();
+        let db = Db::open_in_memory().unwrap();
+        let settings = Settings::load(&config, &db, t0()).unwrap();
+        let mut seen = None;
+        let changed = settings
+            .change(
+                &config,
+                &db,
+                Change::Set(SettingName::MaxAttempts, SettingValue::Whole(6)),
+                None,
+                t0(),
+                |_| seen = Some(settings.effective().config.max_attempts),
+            )
+            .unwrap();
+        assert!(matches!(changed, Ok((true, _))));
+        assert_eq!(seen, Some(6));
+    }
+
+    #[test]
+    fn tags_match_exactly() {
+        let config = Config {
+            daemons: PeerPolicy {
+                logins: vec!["a@example.com".to_owned()],
+                tags: vec!["tag:mesh".to_owned()],
+                ..PeerPolicy::default()
+            },
+            ..proxy_only()
+        };
+        let db = Db::open_in_memory().unwrap();
+        let settings = Settings::load(&config, &db, t0()).unwrap();
+        let tag = |value: &str| Change::Add(ListGroup::Daemons, ListKind::Tags, value.to_owned());
+        assert_eq!(change(&config, &db, &settings, tag("tag:mesh")), Ok(false));
+        assert_eq!(change(&config, &db, &settings, tag("tag:Mesh")), Ok(true));
+        assert_eq!(change(&config, &db, &settings, tag("tag:Mesh")), Ok(false));
+        assert_eq!(
+            settings.effective().policies.daemons.tags,
+            ["tag:mesh", "tag:Mesh"]
+        );
+        assert!(matches!(
+            change(
+                &config,
+                &db,
+                &settings,
+                Change::Remove(ListGroup::Daemons, ListKind::Tags, "TAG:MESH".to_owned())
+            ),
+            Err(Refusal::Missing(_))
+        ));
+        assert_eq!(
+            change(
+                &config,
+                &db,
+                &settings,
+                Change::Remove(ListGroup::Daemons, ListKind::Tags, "tag:Mesh".to_owned())
+            ),
+            Ok(true)
+        );
+        assert_eq!(settings.effective().policies.daemons.tags, ["tag:mesh"]);
+    }
+
+    #[test]
+    fn the_body_limit_ceiling_follows_the_config() {
+        let low = proxy_only();
+        let high = Config {
+            max_body_bytes: 300 * 1024 * 1024,
+            ..proxy_only()
+        };
+        let at = |config: &Config, bytes: u64| {
+            check_value(
+                config,
+                SettingName::MaxBodyBytes,
+                SettingValue::Whole(bytes),
+            )
+        };
+        assert!(at(&low, MAX_WEB_BODY_BYTES).is_ok());
+        assert!(at(&low, MAX_WEB_BODY_BYTES + 1).is_err());
+        assert_eq!(
+            at(&high, 300 * 1024 * 1024),
+            Ok(SettingValue::Whole(300 * 1024 * 1024))
+        );
+        assert!(at(&high, 300 * 1024 * 1024 + 1).is_err());
+        assert!(at(&high, 1024).is_err());
     }
 }

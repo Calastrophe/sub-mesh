@@ -621,3 +621,276 @@ async fn the_same_flows_work_by_whois() {
         Err(409)
     );
 }
+
+#[tokio::test]
+async fn an_admin_login_in_another_case_through_the_proxy_is_an_admin() {
+    let (_state, addr) = proxied().await;
+    let shouting = As::proxied(addr, Some("ROOT@EXAMPLE.COM"));
+    assert!(shouting.session().await.unwrap().admin);
+    assert!(shouting.settings(GET, SETTINGS_PATH).await.is_ok());
+    assert!(
+        shouting
+            .settings(PUT, &consumer_login("x@example.com"))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn cross_site_decisions_and_removals_are_refused() {
+    let (_state, addr) = proxied().await;
+    let root = As::proxied(addr, Some(ROOT));
+    As::proxied(addr, Some(CAROL)).ask(None).await.unwrap();
+    root.settings(PUT, &consumer_login("x@example.com"))
+        .await
+        .unwrap();
+    for (method, path) in [
+        (POST, decision_path(CAROL, true)),
+        (POST, decision_path(CAROL, false)),
+        (DELETE, request_path(CAROL)),
+        (DELETE, consumer_login("x@example.com")),
+        (DELETE, setting_path(SettingName::MaxAttempts)),
+    ] {
+        let request = root
+            .request(method.clone(), &path)
+            .header("origin", "http://evil.example")
+            .header("host", addr.to_string());
+        assert_eq!(root.settings_with(request).await, Err(403), "{path}");
+        let request = root
+            .request(method, &path)
+            .header("sec-fetch-site", "cross-site");
+        assert_eq!(root.settings_with(request).await, Err(403), "{path}");
+    }
+    let view = root.settings(GET, SETTINGS_PATH).await.unwrap();
+    assert_eq!(view.pending(), 1);
+    assert_eq!(view.consumers.logins.len(), 3);
+}
+
+#[tokio::test]
+async fn settings_are_read_only_without_whois() {
+    let state = crate::testing::state();
+    let addr = serve(state.clone()).await;
+    let anyone = As::proxied(addr, None);
+    let view = anyone.settings(GET, SETTINGS_PATH).await.unwrap();
+    assert!(view.fixed.insecure_skip_whois);
+    state
+        .db
+        .request_access(CAROL, None, chrono::Utc::now())
+        .unwrap();
+    for (method, path) in [
+        (PUT, consumer_login(CAROL)),
+        (DELETE, consumer_login(CAROL)),
+        (DELETE, setting_path(SettingName::MaxAttempts)),
+        (POST, decision_path(CAROL, true)),
+        (POST, decision_path(CAROL, false)),
+        (DELETE, request_path(CAROL)),
+    ] {
+        assert_eq!(anyone.settings(method, &path).await, Err(403), "{path}");
+    }
+    assert_eq!(
+        anyone.set(SettingName::MaxAttempts, json!(5)).await,
+        Err(403)
+    );
+    assert_eq!(state.tuning().config.max_attempts, 3);
+    assert_eq!(
+        anyone.settings(GET, SETTINGS_PATH).await.unwrap().pending(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn path_values_are_trimmed_and_dot_logins_refused() {
+    let (_state, addr) = proxied().await;
+    let root = As::proxied(addr, Some(ROOT));
+    let view = root
+        .settings(PUT, &consumer_login(" dave@example.com "))
+        .await
+        .unwrap();
+    assert!(
+        sources(&view, ListGroup::Consumers)
+            .contains(&("dave@example.com".to_owned(), EntrySource::Web))
+    );
+    root.settings(DELETE, &consumer_login("dave@example.com\t"))
+        .await
+        .unwrap();
+    As::proxied(addr, Some(CAROL)).ask(None).await.unwrap();
+    root.settings(POST, &decision_path(" Carol@example.com ", false))
+        .await
+        .unwrap();
+    root.settings(DELETE, &request_path(" carol@example.com"))
+        .await
+        .unwrap();
+    for login in [".", ".."] {
+        let status = root
+            .settings(PUT, &consumer_login(login))
+            .await
+            .unwrap_err();
+        assert!(matches!(status, 400 | 404 | 405), "{login}: {status}");
+        let status = root
+            .settings(POST, &decision_path(login, true))
+            .await
+            .unwrap_err();
+        assert!(matches!(status, 400 | 404 | 405), "{login}: {status}");
+        assert_eq!(As::proxied(addr, Some(login)).ask(None).await, Err(403));
+    }
+    let view = root.settings(GET, SETTINGS_PATH).await.unwrap();
+    assert_eq!(view.consumers.logins.len(), 2);
+    assert!(view.requests.is_empty());
+}
+
+#[tokio::test]
+async fn notes_become_one_line_and_hidden_controls_are_refused() {
+    let (_state, addr) = proxied().await;
+    let erin = As::proxied(addr, Some("erin@example.com"));
+    assert_eq!(erin.ask(Some("right\u{202E}left")).await, Err(400));
+    assert_eq!(erin.ask(Some("zero\u{200B}width")).await, Err(400));
+    let request = erin
+        .ask(Some("from the lab\r\nsecond line\tend"))
+        .await
+        .unwrap()
+        .request
+        .unwrap();
+    assert_eq!(
+        request.note.as_deref(),
+        Some("from the lab second line end")
+    );
+}
+
+#[tokio::test]
+async fn denied_requests_do_not_fill_the_queue() {
+    let (state, addr) = proxied().await;
+    let now = chrono::Utc::now();
+    for index in 0..mesh_core::api::MAX_ACCESS_REQUESTS {
+        let login = format!("user{index}@example.com");
+        state.db.request_access(&login, None, now).unwrap();
+        state.db.deny_request(&login, Some(ROOT), now).unwrap();
+    }
+    let late = As::proxied(addr, Some("late@example.com"));
+    let request = late.ask(None).await.unwrap().request.unwrap();
+    assert_eq!(request.state, RequestState::Pending);
+    for index in 0..mesh_core::api::MAX_ACCESS_REQUESTS - 1 {
+        let login = format!("pending{index}@example.com");
+        state.db.request_access(&login, None, now).unwrap();
+    }
+    assert_eq!(
+        As::proxied(addr, Some("later@example.com")).ask(None).await,
+        Err(429)
+    );
+}
+
+#[tokio::test]
+async fn a_consumer_loses_its_old_request() {
+    let (state, addr) = proxied().await;
+    state
+        .db
+        .request_access(ALICE, Some("old"), chrono::Utc::now())
+        .unwrap();
+    let alice = As::proxied(addr, Some("Alice@example.com"));
+    let session = alice.session().await.unwrap();
+    assert!(session.consumer);
+    assert_eq!(session.request, None);
+    assert!(state.db.access_requests().unwrap().is_empty());
+
+    state
+        .db
+        .request_access(ALICE, None, chrono::Utc::now())
+        .unwrap();
+    let restarted = crate::AppState::new(
+        proxy_config(),
+        state.db.clone(),
+        crate::registry::Registry::new(chrono::TimeDelta::minutes(1), 0.0, false),
+        crate::relay::ModelLists::default(),
+    )
+    .unwrap();
+    assert!(restarted.db.access_requests().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tags_keep_their_case() {
+    let (state, addr) = proxied().await;
+    let root = As::proxied(addr, Some(ROOT));
+    let tags = |value: &str| entry_path(ListGroup::Daemons, ListKind::Tags, value);
+    root.settings(PUT, &tags("tag:mesh")).await.unwrap();
+    let view = root.settings(PUT, &tags("tag:Mesh")).await.unwrap();
+    let listed: Vec<_> = view.daemons.tags.iter().map(|e| e.value.clone()).collect();
+    assert_eq!(listed, ["tag:mesh", "tag:Mesh"]);
+    assert_eq!(root.settings(DELETE, &tags("TAG:MESH")).await, Err(404));
+    root.settings(DELETE, &tags("tag:mesh")).await.unwrap();
+    assert_eq!(state.peers.policies().daemons.tags, ["tag:Mesh"]);
+}
+
+#[tokio::test]
+async fn the_web_body_limit_has_a_ceiling() {
+    let (state, addr) = proxied().await;
+    let root = As::proxied(addr, Some(ROOT));
+    let ceiling = mesh_core::api::MAX_WEB_BODY_BYTES;
+    assert_eq!(
+        root.set(SettingName::MaxBodyBytes, json!(ceiling + 1))
+            .await,
+        Err(400)
+    );
+    root.set(SettingName::MaxBodyBytes, json!(ceiling))
+        .await
+        .unwrap();
+    assert_eq!(state.tuning().config.max_body_bytes as u64, ceiling);
+}
+
+#[tokio::test]
+async fn removing_a_daemon_login_closes_its_tunnel_and_drops_it() {
+    use crate::peer::Grant;
+    use crate::testing::{FakeDaemon, Stub, generation_of, serve_app, wait_for_detach};
+
+    let (state, addr) = proxied().await;
+    let root = As::proxied(addr, Some(ROOT));
+    root.settings(PUT, &daemon_login(CAROL)).await.unwrap();
+    let tunnels = serve_app(
+        axum::Router::new()
+            .route(
+                mesh_core::protocol::TUNNEL_PATH,
+                axum::routing::get(
+                    |axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+                     request: axum::extract::Request| async {
+                        let grant = Grant::Who {
+                            login: CAROL.to_owned(),
+                            tags: Vec::new(),
+                        };
+                        crate::tunnel::connect(state, Some(CAROL.to_owned()), grant, request)
+                    },
+                ),
+            )
+            .with_state(state.clone()),
+    )
+    .await;
+    let stub = Stub::new();
+    let mut daemon = FakeDaemon::dial(&state, tunnels, "carol-box", stub.router()).await;
+    crate::testing::apply(
+        &state,
+        report("carol-box", vec![account("carol-acct", 0.5)]),
+        Some(CAROL),
+    )
+    .await;
+    assert_eq!(
+        state
+            .with_registry(|r| r.snapshot(chrono::Utc::now()))
+            .accounts
+            .len(),
+        1
+    );
+
+    root.settings(PUT, &consumer_login("x@example.com"))
+        .await
+        .unwrap();
+    assert_eq!(generation_of(&state, "carol-box"), Some(daemon.generation));
+
+    root.settings(DELETE, &daemon_login(CAROL)).await.unwrap();
+    wait_for_detach(&state, "carol-box", daemon.generation).await;
+    daemon.closed().await;
+    assert_eq!(state.with_registry(|r| r.daemon_owner("carol-box")), None);
+    assert!(
+        state
+            .with_registry(|r| r.snapshot(chrono::Utc::now()))
+            .accounts
+            .is_empty()
+    );
+    assert!(state.db.load().unwrap().daemons.is_empty());
+}

@@ -169,15 +169,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn remove_entry(
-        &self,
-        group: ListGroup,
-        kind: ListKind,
-        value: &str,
-    ) -> anyhow::Result<bool> {
+    pub fn delete_entry(&self, entry: &StoredEntry) -> anyhow::Result<bool> {
         Ok(self.conn().execute(
-            "DELETE FROM access_entries WHERE list = ?1 AND value = ?2",
-            params![list_key(group, kind), value],
+            "DELETE FROM access_entries WHERE list = ?1 AND value = ?2 COLLATE BINARY",
+            params![list_key(entry.group, entry.kind), entry.value],
         )? > 0)
     }
 
@@ -240,8 +235,11 @@ impl Db {
         if let Some(existing) = find_request(&tx, login)? {
             return Ok(RequestOutcome::Existing(existing));
         }
-        let count: i64 =
-            tx.query_row("SELECT COUNT(*) FROM access_requests", [], |row| row.get(0))?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM access_requests WHERE state = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
         if usize::try_from(count).unwrap_or(usize::MAX) >= MAX_ACCESS_REQUESTS {
             return Ok(RequestOutcome::Full);
         }
@@ -286,6 +284,24 @@ impl Db {
              WHERE login = ?1",
             params![login, by, time_text(now)],
         )? > 0)
+    }
+
+    pub fn forget_requests_of(&self, logins: &[String]) -> anyhow::Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        for login in logins {
+            count += tx.execute("DELETE FROM access_requests WHERE login = ?1", [login])?;
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    pub fn expire_denied(&self, cutoff: DateTime<Utc>) -> anyhow::Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM access_requests WHERE state = 'denied' AND decided_at < ?1",
+            [time_text(cutoff)],
+        )?)
     }
 
     pub fn forget_request(&self, login: &str) -> anyhow::Result<bool> {
@@ -340,12 +356,9 @@ mod tests {
         assert!(stored.entries.contains(&tag));
         assert_eq!(stored.values, [headroom]);
 
+        assert!(db.delete_entry(&login).unwrap());
         assert!(
-            db.remove_entry(ListGroup::Consumers, ListKind::Logins, "Bob@Example.com")
-                .unwrap()
-        );
-        assert!(
-            !db.remove_entry(ListGroup::Daemons, ListKind::Logins, "tag:mesh")
+            !db.delete_entry(&entry(ListGroup::Daemons, ListKind::Logins, "tag:mesh"))
                 .unwrap()
         );
         assert!(
@@ -417,6 +430,95 @@ mod tests {
             db.request_access("late@example.com", None, t0()).unwrap(),
             RequestOutcome::Created(_)
         ));
+    }
+
+    #[test]
+    fn tags_differ_by_case_and_logins_do_not() {
+        let db = Db::open_in_memory().unwrap();
+        for value in ["tag:mesh", "tag:Mesh"] {
+            db.add_entry(&entry(ListGroup::Daemons, ListKind::Tags, value))
+                .unwrap();
+        }
+        for value in ["bob@example.com", "BOB@example.com"] {
+            db.add_entry(&entry(ListGroup::Daemons, ListKind::Logins, value))
+                .unwrap();
+        }
+        let values: Vec<_> = db
+            .load_settings()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect();
+        assert_eq!(values.len(), 3, "{values:?}");
+        assert!(values.contains(&"tag:Mesh".to_owned()));
+        assert!(
+            !db.delete_entry(&entry(ListGroup::Daemons, ListKind::Tags, "TAG:MESH"))
+                .unwrap()
+        );
+        assert!(
+            db.delete_entry(&entry(ListGroup::Daemons, ListKind::Tags, "tag:Mesh"))
+                .unwrap()
+        );
+        assert_eq!(db.load_settings().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn a_nocase_table_is_rebuilt_with_its_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE access_entries (
+                 list     TEXT NOT NULL,
+                 value    TEXT NOT NULL COLLATE NOCASE,
+                 added_by TEXT,
+                 added_at TEXT NOT NULL,
+                 PRIMARY KEY (list, value)
+             );
+             INSERT INTO access_entries VALUES
+                 ('daemons.tags', 'tag:mesh', 'a', '2026-01-01T00:00:00Z'),
+                 ('consumers.logins', 'Bob@example.com', NULL, '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert_eq!(db.load_settings().unwrap().entries.len(), 2);
+        db.add_entry(&entry(ListGroup::Daemons, ListKind::Tags, "tag:Mesh"))
+            .unwrap();
+        db.add_entry(&entry(
+            ListGroup::Consumers,
+            ListKind::Logins,
+            "bob@example.com",
+        ))
+        .unwrap();
+        assert_eq!(db.load_settings().unwrap().entries.len(), 3);
+    }
+
+    #[test]
+    fn only_pending_requests_fill_the_queue_and_old_denials_expire() {
+        let db = Db::open_in_memory().unwrap();
+        for index in 0..MAX_ACCESS_REQUESTS {
+            let login = format!("user{index}@example.com");
+            db.request_access(&login, None, t0()).unwrap();
+            assert!(db.deny_request(&login, None, t0()).unwrap());
+        }
+        assert!(matches!(
+            db.request_access("late@example.com", None, t0()).unwrap(),
+            RequestOutcome::Created(_)
+        ));
+        assert_eq!(db.access_requests().unwrap().len(), MAX_ACCESS_REQUESTS + 1);
+        let later = t0() + chrono::TimeDelta::days(31);
+        assert!(db.deny_request("late@example.com", None, later).unwrap());
+        assert_eq!(
+            db.expire_denied(later - chrono::TimeDelta::days(30))
+                .unwrap(),
+            MAX_ACCESS_REQUESTS
+        );
+        assert_eq!(db.access_requests().unwrap().len(), 1);
+        assert_eq!(
+            db.forget_requests_of(&["LATE@example.com".to_owned()])
+                .unwrap(),
+            1
+        );
+        assert!(db.access_requests().unwrap().is_empty());
     }
 
     #[test]

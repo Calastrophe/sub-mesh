@@ -34,7 +34,14 @@ async fn tunnel_as_header(State(state): State<Arc<AppState>>, request: Request) 
         .get(LOGIN_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    crate::tunnel::connect(state, login, request)
+    let grant = match &login {
+        Some(login) => crate::peer::Grant::Who {
+            login: login.clone(),
+            tags: Vec::new(),
+        },
+        None => crate::peer::Grant::Open,
+    };
+    crate::tunnel::connect(state, login, grant, request)
 }
 
 /// Serve only the tunnel route. The peer's login comes from
