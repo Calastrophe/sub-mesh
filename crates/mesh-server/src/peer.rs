@@ -1,10 +1,15 @@
 //! Who may talk to the server: tailnet identity checks.
+//!
+//! A caller is known by whois of its address. A request from a configured
+//! trusted proxy is known by the login that the proxy names in a header
+//! instead; see [`crate::config::TrustedProxy`].
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use axum::http::{HeaderMap, HeaderName};
 use mesh_relay::tailscale::{self, LocalClient, WhoIs};
 use tokio::sync::OnceCell;
 
@@ -14,12 +19,18 @@ use crate::config::{Config, PeerPolicy};
 const WHOIS_TTL: Duration = Duration::from_secs(60);
 const CACHE_LIMIT: usize = 256;
 
+/// The node name of callers that the trusted proxy identified. Whois would
+/// name the proxy's machine, not theirs.
+pub const PROXY_NODE: &str = "via-proxy";
+/// The longest login taken from the trusted proxy's header.
+const MAX_PROXY_LOGIN: usize = 254;
+
 /// Which set of routes a request is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Consumer routes and the management API.
     Consumer,
-    /// The daemon report route.
+    /// The daemon routes: reports and the tunnel.
     Daemon,
 }
 
@@ -89,10 +100,14 @@ pub fn decide(
     if loopback_allowed(addr, policy) {
         return Decision::Allow(Peer::anonymous("loopback"));
     }
-    let who = match who {
-        Ok(who) => who,
-        Err(error) => return Decision::Deny(format!("whois failed for {addr}: {error}")),
-    };
+    match who {
+        Ok(who) => admit(who, policy, own_login),
+        Err(error) => Decision::Deny(format!("whois failed for {addr}: {error}")),
+    }
+}
+
+/// Decide whether the caller `who` may pass `policy`, by its login or tags.
+fn admit(who: &WhoIs, policy: &PeerPolicy, own_login: Option<&str>) -> Decision {
     let login = who.login_name.trim();
     let matches_login = |allowed: &str| !login.is_empty() && allowed.eq_ignore_ascii_case(login);
     let login_ok = if policy.logins.is_empty() {
@@ -111,10 +126,90 @@ pub fn decide(
     }
 }
 
+/// The login that the trusted proxy names in `header`. A request must carry
+/// exactly one plausible login; the proxy sets the header for every request
+/// it identified.
+fn proxy_login<'a>(headers: &'a HeaderMap, header: &HeaderName) -> Result<&'a str, String> {
+    let mut values = headers.get_all(header).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(value), None) => value,
+        (None, _) => return Err(format!("the trusted proxy sent no {header} header")),
+        _ => {
+            return Err(format!(
+                "the trusted proxy sent more than one {header} header"
+            ));
+        }
+    };
+    let login = std::str::from_utf8(value.as_bytes())
+        .map_err(|_| format!("the {header} header is not UTF-8"))?
+        .trim();
+    if login.is_empty() {
+        return Err(format!("the {header} header is empty"));
+    }
+    if login.len() > MAX_PROXY_LOGIN {
+        return Err(format!("the {header} header is too long"));
+    }
+    if login.chars().any(char::is_control) {
+        return Err(format!("the {header} header has control characters"));
+    }
+    if login.eq_ignore_ascii_case(TAGGED_LOGIN) {
+        return Err(format!("the {header} header names no user"));
+    }
+    Ok(login)
+}
+
+/// Whether a browser says that a page of another site made the request.
+/// Through the proxy the browser's own tailnet identity is attached to any
+/// request it makes, as it is for direct tailnet callers.
+fn cross_site(headers: &HeaderMap) -> bool {
+    let mut sites = headers.get_all("sec-fetch-site").iter();
+    match (sites.next(), sites.next()) {
+        (None, _) => false,
+        (Some(site), None) => !matches!(site.as_bytes(), b"same-origin" | b"none"),
+        _ => true,
+    }
+}
+
+/// Decide whether a request that came through the trusted proxy may pass
+/// `policy`, as if whois had named the login in its header.
+///
+/// This holds for daemon routes as for consumer routes: a daemon gets the
+/// rights its login would have by whois. Its node name, from the tunnel
+/// upgrade or its report, is only a label under that login. Requests that
+/// a browser made from another site are refused.
+fn decide_proxied(
+    headers: &HeaderMap,
+    header: &HeaderName,
+    policy: &PeerPolicy,
+    own_login: Option<&str>,
+) -> Decision {
+    let login = match proxy_login(headers, header) {
+        Ok(login) => login,
+        Err(reason) => return Decision::Deny(reason),
+    };
+    if cross_site(headers) {
+        return Decision::Deny(format!(
+            "a page of another site sent a request as {login} through the trusted proxy"
+        ));
+    }
+    let who = WhoIs {
+        login_name: login.to_owned(),
+        node_name: PROXY_NODE.to_owned(),
+        tags: Vec::new(),
+    };
+    admit(&who, policy, own_login)
+}
+
 /// Runs peer checks, with a short whois cache.
 pub struct PeerChecker {
     client: LocalClient,
     skip_whois: bool,
+    /// The trusted proxy's addresses, canonical. Never looked up by whois
+    /// and never cached: one proxy address serves many callers.
+    proxies: Vec<IpAddr>,
+    proxy_header: HeaderName,
+    /// Only the trusted proxy may call; whois is never asked.
+    proxy_only: bool,
     consumers: PeerPolicy,
     daemons: PeerPolicy,
     own_login: OnceCell<String>,
@@ -126,6 +221,14 @@ impl PeerChecker {
         PeerChecker {
             client: LocalClient::new(config.tailscale_socket.clone()),
             skip_whois: config.insecure_skip_whois,
+            proxies: config
+                .trusted_proxy
+                .addrs
+                .iter()
+                .map(IpAddr::to_canonical)
+                .collect(),
+            proxy_header: config.trusted_proxy.header_name(),
+            proxy_only: config.trusted_proxy.only,
             consumers: config.consumers.clone(),
             daemons: config.daemons.clone(),
             own_login: OnceCell::new(),
@@ -133,8 +236,18 @@ impl PeerChecker {
         }
     }
 
-    /// Check the peer at `addr` for `role`.
-    pub async fn check(&self, addr: SocketAddr, role: Role) -> Decision {
+    /// The header that names the caller's login on requests from the
+    /// trusted proxy. It must not reach daemons or providers.
+    pub fn identity_header(&self) -> &HeaderName {
+        &self.proxy_header
+    }
+
+    fn is_proxy(&self, addr: SocketAddr) -> bool {
+        self.proxies.contains(&addr.ip().to_canonical())
+    }
+
+    /// Check the peer at `addr`, which sent `headers`, for `role`.
+    pub async fn check(&self, addr: SocketAddr, headers: &HeaderMap, role: Role) -> Decision {
         let policy = match role {
             Role::Consumer => &self.consumers,
             Role::Daemon => &self.daemons,
@@ -142,8 +255,21 @@ impl PeerChecker {
         if self.skip_whois {
             return Decision::Allow(Peer::anonymous(&addr.ip().to_canonical().to_string()));
         }
+        if self.is_proxy(addr) {
+            let own_login = if policy.logins.is_empty() {
+                self.own_login().await
+            } else {
+                None
+            };
+            return decide_proxied(headers, &self.proxy_header, policy, own_login);
+        }
         if loopback_allowed(addr, policy) {
             return Decision::Allow(Peer::anonymous("loopback"));
+        }
+        if self.proxy_only {
+            return Decision::Deny(format!(
+                "{addr} is not the trusted proxy, and trusted_proxy.only is set"
+            ));
         }
         let own_login = if policy.logins.is_empty() {
             self.own_login().await
@@ -207,7 +333,11 @@ impl PeerChecker {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
+    #[cfg(unix)]
+    use crate::testing::fake_tailscaled;
 
     fn who(login: &str, tags: &[&str]) -> WhoIs {
         WhoIs {
@@ -310,7 +440,9 @@ mod tests {
             insecure_skip_whois: true,
             ..Config::default()
         });
-        let check = |address: &str| checker.check(address.parse().unwrap(), Role::Consumer);
+        let headers = HeaderMap::new();
+        let check =
+            |address: &str| checker.check(address.parse().unwrap(), &headers, Role::Consumer);
         let first = check("100.64.0.1:1000").await;
         assert_eq!(first, check("[::ffff:100.64.0.1]:2000").await);
         assert_ne!(first, check("100.64.0.2:1000").await);
@@ -326,6 +458,259 @@ mod tests {
             &policy,
             Some("me")
         )));
+    }
+
+    const PROXY: &str = "x-webauth-user";
+
+    fn proxied(values: &[&[u8]]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(PROXY, axum::http::HeaderValue::from_bytes(value).unwrap());
+        }
+        headers
+    }
+
+    fn decide_via_proxy(headers: &HeaderMap, policy: &PeerPolicy) -> Decision {
+        let header = HeaderName::from_static(PROXY);
+        decide_proxied(headers, &header, policy, Some("me@example.com"))
+    }
+
+    fn friends() -> PeerPolicy {
+        PeerPolicy {
+            logins: vec!["friend@example.com".to_owned()],
+            ..PeerPolicy::default()
+        }
+    }
+
+    #[test]
+    fn the_proxy_header_names_the_login() {
+        assert_eq!(
+            decide_via_proxy(&proxied(&[b" Friend@Example.com "]), &friends()),
+            Decision::Allow(Peer {
+                node: PROXY_NODE.to_owned(),
+                login: Some("Friend@Example.com".to_owned()),
+            })
+        );
+        assert!(!allowed(&decide_via_proxy(
+            &proxied(&[b"stranger@example.com"]),
+            &friends()
+        )));
+        let owner = PeerPolicy::default();
+        assert!(allowed(&decide_via_proxy(
+            &proxied(&[b"me@example.com"]),
+            &owner
+        )));
+        assert!(!allowed(&decide_via_proxy(
+            &proxied(&[b"friend@example.com"]),
+            &owner
+        )));
+    }
+
+    #[test]
+    fn implausible_proxy_headers_deny() {
+        let long = format!("{}@example.com", "a".repeat(MAX_PROXY_LOGIN));
+        let mut policy = friends();
+        policy.logins.push(long.clone());
+        for values in [
+            &[][..],
+            &[&b""[..]][..],
+            &[&b"   "[..]][..],
+            &[&b"friend@example.com"[..], &b"friend@example.com"[..]][..],
+            &[&b"friend@example.com"[..], &b""[..]][..],
+            &[long.as_bytes()][..],
+            &[&b"friend@example.com\tx"[..]][..],
+            &[&b"friend@example.com\xff"[..]][..],
+        ] {
+            assert!(
+                !allowed(&decide_via_proxy(&proxied(values), &policy)),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_proxy_cannot_claim_a_tagged_node() {
+        let tagged = PeerPolicy {
+            logins: vec!["tagged-devices".to_owned()],
+            tags: vec!["tag:mesh".to_owned()],
+            ..PeerPolicy::default()
+        };
+        let header = HeaderName::from_static(PROXY);
+        for value in [&b"tagged-devices"[..], b"Tagged-Devices"] {
+            let headers = proxied(&[value]);
+            assert!(!allowed(&decide_via_proxy(&headers, &tagged)));
+            let owner = PeerPolicy::default();
+            let own = Some("tagged-devices");
+            let decision = decide_proxied(&headers, &header, &owner, own);
+            assert!(!allowed(&decision));
+        }
+    }
+
+    #[test]
+    fn a_daemon_through_the_proxy_has_the_rights_of_its_login() {
+        let daemons = friends();
+        assert_eq!(
+            decide_via_proxy(&proxied(&[b"friend@example.com"]), &daemons),
+            Decision::Allow(Peer {
+                node: PROXY_NODE.to_owned(),
+                login: Some("friend@example.com".to_owned()),
+            })
+        );
+        assert!(!allowed(&decide_via_proxy(
+            &proxied(&[b"stranger@example.com"]),
+            &daemons
+        )));
+        let tagged = PeerPolicy {
+            tags: vec!["tag:mesh".to_owned()],
+            ..PeerPolicy::default()
+        };
+        assert!(!allowed(&decide_via_proxy(
+            &proxied(&[b"friend@example.com"]),
+            &tagged
+        )));
+    }
+
+    #[test]
+    fn pages_of_other_sites_cannot_use_the_proxy() {
+        let with_site = |sites: &[&'static str]| {
+            let mut headers = proxied(&[b"friend@example.com"]);
+            for site in sites {
+                headers.append("sec-fetch-site", axum::http::HeaderValue::from_static(site));
+            }
+            decide_via_proxy(&headers, &friends())
+        };
+        assert!(allowed(&with_site(&[])));
+        assert!(allowed(&with_site(&["same-origin"])));
+        assert!(allowed(&with_site(&["none"])));
+        assert!(!allowed(&with_site(&["cross-site"])));
+        assert!(!allowed(&with_site(&["same-site"])));
+        assert!(!allowed(&with_site(&["same-origin", "cross-site"])));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_the_proxy_address_is_trusted_and_it_is_never_looked_up() {
+        let (socket, whois_calls) = fake_tailscaled("friend@example.com");
+        let checker = PeerChecker::new(&Config {
+            tailscale_socket: socket.clone(),
+            consumers: friends(),
+            daemons: friends(),
+            trusted_proxy: crate::config::TrustedProxy {
+                addrs: vec!["10.10.10.111".parse().unwrap()],
+                ..Default::default()
+            },
+            ..Config::default()
+        });
+        let proxy: SocketAddr = "10.10.10.111:40000".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:10.10.10.111]:40001".parse().unwrap();
+        let via_proxy = Decision::Allow(Peer {
+            node: PROXY_NODE.to_owned(),
+            login: Some("friend@example.com".to_owned()),
+        });
+        let friend = proxied(&[b"friend@example.com"]);
+        assert_eq!(
+            checker.check(proxy, &friend, Role::Consumer).await,
+            via_proxy
+        );
+        assert_eq!(
+            checker.check(mapped, &friend, Role::Consumer).await,
+            via_proxy
+        );
+        let stranger = proxied(&[b"stranger@example.com"]);
+        assert!(!allowed(
+            &checker.check(proxy, &stranger, Role::Consumer).await
+        ));
+        assert!(!allowed(
+            &checker
+                .check(proxy, &HeaderMap::new(), Role::Consumer)
+                .await
+        ));
+        assert_eq!(checker.check(proxy, &friend, Role::Daemon).await, via_proxy);
+        assert!(!allowed(
+            &checker.check(proxy, &stranger, Role::Daemon).await
+        ));
+        assert_eq!(whois_calls.load(Ordering::SeqCst), 0);
+        assert!(checker.cache.lock().unwrap().is_empty());
+
+        let direct: SocketAddr = "100.64.0.9:5555".parse().unwrap();
+        assert_eq!(
+            checker.check(direct, &stranger, Role::Consumer).await,
+            Decision::Allow(Peer {
+                node: "laptop".to_owned(),
+                login: Some("friend@example.com".to_owned()),
+            })
+        );
+        assert_eq!(whois_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checker.cache.lock().unwrap().len(), 1);
+        assert!(!checker.cache.lock().unwrap().contains_key(&proxy.ip()));
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_header_counts_for_nothing_from_other_addresses() {
+        let (socket, whois_calls) = fake_tailscaled("stranger@example.com");
+        let checker = PeerChecker::new(&Config {
+            tailscale_socket: socket.clone(),
+            consumers: PeerPolicy {
+                logins: vec!["friend@example.com".to_owned()],
+                allow_loopback: true,
+                ..PeerPolicy::default()
+            },
+            trusted_proxy: crate::config::TrustedProxy {
+                addrs: vec!["10.10.10.111".parse().unwrap()],
+                ..Default::default()
+            },
+            ..Config::default()
+        });
+        let friend = proxied(&[b"friend@example.com"]);
+        let direct: SocketAddr = "100.64.0.9:5555".parse().unwrap();
+        assert!(!allowed(
+            &checker.check(direct, &friend, Role::Consumer).await
+        ));
+        assert_eq!(whois_calls.load(Ordering::SeqCst), 1);
+        let loopback: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        assert_eq!(
+            checker.check(loopback, &friend, Role::Consumer).await,
+            Decision::Allow(Peer::anonymous("loopback"))
+        );
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_only_server_never_asks_whois() {
+        let checker = PeerChecker::new(&Config {
+            tailscale_socket: "/nonexistent/tailscaled.sock".into(),
+            consumers: PeerPolicy {
+                allow_loopback: true,
+                ..friends()
+            },
+            daemons: friends(),
+            trusted_proxy: crate::config::TrustedProxy {
+                addrs: vec!["10.10.10.111".parse().unwrap()],
+                only: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        });
+        let friend = proxied(&[b"friend@example.com"]);
+        let proxy: SocketAddr = "10.10.10.111:40000".parse().unwrap();
+        for role in [Role::Consumer, Role::Daemon] {
+            assert!(allowed(&checker.check(proxy, &friend, role).await));
+        }
+        let direct: SocketAddr = "100.64.0.9:5555".parse().unwrap();
+        let Decision::Deny(reason) = checker.check(direct, &friend, Role::Daemon).await else {
+            panic!("a direct caller was allowed");
+        };
+        assert!(reason.contains("trusted_proxy.only"), "{reason}");
+        let loopback: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        assert!(allowed(
+            &checker.check(loopback, &friend, Role::Consumer).await
+        ));
+        assert!(!allowed(
+            &checker.check(loopback, &friend, Role::Daemon).await
+        ));
+        assert!(checker.cache.lock().unwrap().is_empty());
     }
 
     #[test]

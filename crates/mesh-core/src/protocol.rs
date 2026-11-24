@@ -1,9 +1,12 @@
 //! Paths and headers shared by `mesh-server` and `mesh-daemon`.
 //!
-//! The daemon checks the server's tailnet identity, then sends `GET`
-//! [`TUNNEL_PATH`] with `Connection: upgrade`, `Upgrade:` [`TUNNEL_PROTOCOL`],
-//! and [`NODE_HEADER`]. The server checks the caller against its `[daemons]`
-//! policy using tailnet whois before returning `101 Switching Protocols`.
+//! The daemon checks the server's identity (tailnet whois over `http://`,
+//! the TLS certificate over `https://`), then sends `GET` [`TUNNEL_PATH`]
+//! with `Connection: upgrade`, `Upgrade:` [`TUNNEL_PROTOCOL`], and
+//! [`NODE_HEADER`] over HTTP/1.1, so a reverse proxy can carry it. The
+//! server checks the caller against its `[daemons]` policy, using tailnet
+//! whois or a trusted proxy's identity header, before returning
+//! `101 Switching Protocols`.
 //! After upgrade, the server becomes the HTTP/2 client and sends each relay
 //! or control call on its own stream. WebSockets use extended `CONNECT`
 //! (RFC 8441). The daemon sends reports separately and redials with backoff
@@ -43,6 +46,20 @@ pub const TUNNEL_PROTOCOL: &str = "mesh-tunnel/1";
 /// Request header on the tunnel upgrade naming the daemon's node. It must
 /// match the `node` of the daemon's reports.
 pub const NODE_HEADER: &str = "x-mesh-node";
+
+/// The longest node name the server accepts, in bytes.
+pub const MAX_NODE_NAME: usize = 128;
+
+/// Whether `node` can name a daemon: not empty or padded with spaces, at
+/// most [`MAX_NODE_NAME`] bytes, and without control characters. The node
+/// name is only a label under the daemon's login; it never identifies the
+/// caller.
+pub fn valid_node_name(node: &str) -> bool {
+    !node.is_empty()
+        && node.len() <= MAX_NODE_NAME
+        && node.trim() == node
+        && !node.chars().any(char::is_control)
+}
 
 /// Prefix of the daemon relay route: `/relay/{account_id}/{*path}`.
 pub const RELAY_PREFIX: &str = "/relay";
@@ -144,6 +161,18 @@ impl FromStr for HeadroomHint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_names() {
+        use super::{MAX_NODE_NAME, valid_node_name};
+        assert!(valid_node_name("box"));
+        assert!(valid_node_name("Vlad's MacBook Pro"));
+        assert!(valid_node_name(&"n".repeat(MAX_NODE_NAME)));
+        for bad in ["", " ", " box", "box ", "a\tb", "a\nb", "a\u{7f}b"] {
+            assert!(!valid_node_name(bad), "{bad:?}");
+        }
+        assert!(!valid_node_name(&"n".repeat(MAX_NODE_NAME + 1)));
+    }
+
     use super::*;
     use crate::DenyReason;
 

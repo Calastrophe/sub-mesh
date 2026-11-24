@@ -94,10 +94,17 @@ fn rejects_bad_config() {
     let non_loopback = parse("server_url = \"http://s:1\"\nadmin_listen = \"100.64.0.5:7072\"");
     assert!(non_loopback.resolve(Some(&own()), "h").is_err());
 
-    let https = parse(r#"server_url = "https://s:1""#);
-    assert!(https.resolve(None, "h").is_err());
+    let https = parse(r#"server_url = "https://mesh.example.com/""#)
+        .resolve(None, "h")
+        .expect("https is allowed");
+    assert_eq!(https.server_url, "https://mesh.example.com");
+    assert_eq!(https.server.port_or_known_default(), Some(443));
 
     for url in [
+        "ftp://s",
+        "ws://s",
+        "https://s/path",
+        "https://user@s",
         "http://s/path",
         "http://s/?q=1",
         "http://s/#fragment",
@@ -106,6 +113,13 @@ fn rejects_bad_config() {
         let config = parse(&format!("server_url = {url:?}"));
         assert!(config.resolve(Some(&own()), "h").is_err());
     }
+
+    for node in ["\"\"", "\"a\\tb\"", &format!("{:?}", "n".repeat(200))] {
+        let config = parse(&format!("server_url = \"http://s:1\"\nnode = {node}"));
+        assert!(config.resolve(Some(&own()), "h").is_err(), "{node}");
+    }
+    let padded = parse("server_url = \"http://s:1\"\nnode = \" box \"");
+    assert_eq!(padded.resolve(Some(&own()), "h").unwrap().node, "box");
 
     let zero = parse("server_url = \"http://s:1\"\npoll_interval_secs = 0");
     assert!(zero.resolve(Some(&own()), "h").is_err());

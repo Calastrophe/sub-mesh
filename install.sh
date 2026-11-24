@@ -104,9 +104,9 @@ check_platform() {
 check_server_url() {
     [ -n "$SERVER_URL" ] || return 0
     printf '%s\n' "$SERVER_URL" | LC_ALL=C awk '
-        NR == 1 && /^http:\/\/[^[:space:][:cntrl:]"\\]+$/ { ok = 1 }
+        NR == 1 && /^https?:\/\/[^[:space:][:cntrl:]"\\]+$/ { ok = 1 }
         END { exit !(NR == 1 && ok) }
-    ' || die "invalid server URL (use http://HOST:7070)"
+    ' || die "invalid server URL (use http://HOST:7070 or https://HOST)"
 }
 
 set_paths() {

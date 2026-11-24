@@ -69,6 +69,9 @@ fn default_tailscale_socket() -> PathBuf {
 /// The `[allowed_peers]` table: which servers the daemon trusts. The daemon
 /// checks the tailnet identity of the host behind `server_url` before it
 /// opens its tunnel, and sends nothing to a host that fails the check.
+///
+/// This applies to an `http://` `server_url` only. An `https://` server is
+/// identified by its TLS certificate for the URL's host instead.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PeerPolicy {
@@ -187,7 +190,7 @@ impl Config {
     pub fn resolve(self, own: Option<&SelfStatus>, hostname: &str) -> Result<Settings> {
         let server_url = self.server_url.trim_end_matches('/').to_owned();
         let parsed = Url::parse(&server_url).context("server_url is not a valid URL")?;
-        if parsed.scheme() != "http"
+        if !matches!(parsed.scheme(), "http" | "https")
             || parsed.host_str().is_none()
             || !parsed.username().is_empty()
             || parsed.password().is_some()
@@ -195,7 +198,7 @@ impl Config {
             || parsed.query().is_some()
             || parsed.fragment().is_some()
         {
-            bail!("server_url must be an http:// origin without credentials");
+            bail!("server_url must be an http:// or https:// origin without credentials");
         }
 
         let admin_listen = self
@@ -207,11 +210,18 @@ impl Config {
 
         let node = self
             .node
+            .map(|node| node.trim().to_owned())
             .or_else(|| {
                 own.map(|status| status.host_name.clone())
                     .filter(|name| !name.is_empty())
             })
             .unwrap_or_else(|| hostname.to_owned());
+        if !mesh_core::protocol::valid_node_name(&node) {
+            bail!(
+                "node {node:?} is not a valid node name: use at most {} bytes and no control characters",
+                mesh_core::protocol::MAX_NODE_NAME
+            );
+        }
 
         let data_dir = match self.data_dir {
             Some(dir) => dir,

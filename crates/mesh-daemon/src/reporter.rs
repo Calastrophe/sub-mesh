@@ -7,8 +7,6 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{Method, Request};
 use hyper_util::rt::TokioIo;
 use mesh_core::protocol::REPORT_PATH;
-use tokio::net::TcpStream;
-use url::Position;
 
 use crate::peer;
 use crate::state::AppState;
@@ -34,19 +32,12 @@ pub async fn run(state: &AppState) {
 }
 
 async fn send(state: &AppState) -> Result<(), String> {
-    let server = &state.settings.server;
-    let host = &server[Position::BeforeHost..Position::AfterPort];
-    let port = server
-        .port_or_known_default()
-        .expect("validated HTTP server URL");
-    let address = format!(
-        "{}:{port}",
-        server.host_str().expect("validated server host")
-    );
-    let stream = TcpStream::connect(address)
+    let dial = mesh_relay::tunnel::Dial::connect(&state.settings.server)
         .await
         .map_err(|err| err.to_string())?;
-    peer::verify_server(state, stream.peer_addr().map_err(|err| err.to_string())?).await?;
+    peer::verify_dial(state, &dial).await?;
+    let host = dial.host().to_owned();
+    let stream = dial.into_io();
 
     state.refresh_owner().await;
     let body = serde_json::to_vec(&state.daemon_report()).map_err(|err| err.to_string())?;

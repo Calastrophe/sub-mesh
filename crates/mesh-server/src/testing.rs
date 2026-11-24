@@ -19,10 +19,14 @@ use crate::relay::ModelLists;
 use crate::{AppState, ReportOutcome, router};
 
 mod daemon;
+mod proxy;
 
 pub use daemon::{
     FakeDaemon, LOGIN_HEADER, Reply, Seen, Stub, generation_of, serve_tunnels, wait_for_detach,
 };
+#[cfg(unix)]
+pub use proxy::fake_tailscaled;
+pub use proxy::{PROXY_HEADER, start_proxy};
 
 /// A state with peer checks off and no dashboard.
 pub fn state() -> Arc<AppState> {
