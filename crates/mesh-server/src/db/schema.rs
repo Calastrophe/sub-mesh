@@ -60,6 +60,27 @@ CREATE TABLE IF NOT EXISTS cache_warmth (
     ttl_secs   INTEGER NOT NULL CHECK (ttl_secs BETWEEN 1 AND 4294967295),
     PRIMARY KEY (provider, scope_kind, scope)
 );
+CREATE TABLE IF NOT EXISTS access_entries (
+    list     TEXT NOT NULL,
+    value    TEXT NOT NULL COLLATE NOCASE,
+    added_by TEXT,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (list, value)
+);
+CREATE TABLE IF NOT EXISTS setting_overrides (
+    name   TEXT PRIMARY KEY,
+    value  TEXT NOT NULL,
+    set_by TEXT,
+    set_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS access_requests (
+    login        TEXT PRIMARY KEY COLLATE NOCASE,
+    note         TEXT,
+    state        TEXT NOT NULL CHECK (state IN ('pending', 'denied')),
+    requested_at TEXT NOT NULL,
+    decided_by   TEXT,
+    decided_at   TEXT
+);
 ";
 
 /// Create the tables, serialized even across concurrent starts. A database

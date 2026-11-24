@@ -1,10 +1,9 @@
 //! Helpers shared by the tests that run the whole router.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use chrono::{TimeDelta, Utc};
@@ -13,7 +12,6 @@ use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::peer::PeerChecker;
 use crate::registry::Registry;
 use crate::relay::ModelLists;
 use crate::{AppState, ReportOutcome, router};
@@ -24,9 +22,9 @@ mod proxy;
 pub use daemon::{
     FakeDaemon, LOGIN_HEADER, Reply, Seen, Stub, generation_of, serve_tunnels, wait_for_detach,
 };
-#[cfg(unix)]
-pub use proxy::fake_tailscaled;
 pub use proxy::{PROXY_HEADER, start_proxy};
+#[cfg(unix)]
+pub use proxy::{fake_tailnet, fake_tailscaled};
 
 /// A state with peer checks off and no dashboard.
 pub fn state() -> Arc<AppState> {
@@ -52,20 +50,12 @@ pub fn state_exact(config: Config) -> Arc<AppState> {
 /// A state like [`state_exact`] that keeps its merged model lists in `lists`.
 pub fn state_with_lists(config: Config, model_lists: ModelLists) -> Arc<AppState> {
     let db = Db::open_in_memory().unwrap();
-    Arc::new(AppState {
-        peers: PeerChecker::new(&config),
-        registry: Mutex::new(Registry::new(
-            TimeDelta::minutes(1),
-            config.affinity_min_headroom,
-            config.insecure_skip_whois,
-        )),
-        config,
-        reports: Mutex::new(()),
-        request_log: crate::log::Log::start(db.clone()).unwrap(),
-        db,
-        clients: Mutex::new(HashMap::new()),
-        model_lists,
-    })
+    let registry = Registry::new(
+        TimeDelta::minutes(1),
+        config.affinity_min_headroom,
+        config.insecure_skip_whois,
+    );
+    AppState::new(config, db, registry, model_lists).unwrap()
 }
 
 /// A Codex account that admits traffic with `headroom` and has no windows.

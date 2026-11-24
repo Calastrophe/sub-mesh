@@ -9,9 +9,12 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
-use mesh_core::api::{LOGS_PATH, OVERVIEW_PATH, USAGE_PATH};
+use mesh_core::api::{
+    ACCESS_REQUEST_PATH, LOGS_PATH, OVERVIEW_PATH, SESSION_PATH, SETTINGS_PATH, USAGE_PATH,
+};
 
 use crate::AppState;
 
@@ -20,6 +23,8 @@ mod failure;
 mod logs;
 mod origin;
 mod overview;
+mod session;
+mod settings;
 mod subscriptions;
 mod usage;
 
@@ -47,6 +52,41 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(subscriptions::resume),
         )
         .route("/api/v1/subscriptions/{id}", delete(subscriptions::delete))
+        .route(SETTINGS_PATH, get(settings::get))
+        .route(
+            "/api/v1/settings/consumers/{list}/{value}",
+            put(settings::add_consumer).delete(settings::remove_consumer),
+        )
+        .route(
+            "/api/v1/settings/daemons/{list}/{value}",
+            put(settings::add_daemon).delete(settings::remove_daemon),
+        )
+        .route(
+            "/api/v1/settings/values/{name}",
+            put(settings::set_value).delete(settings::reset_value),
+        )
+        .route(
+            "/api/v1/settings/requests/{login}",
+            delete(settings::forget),
+        )
+        .route(
+            "/api/v1/settings/requests/{login}/approve",
+            post(settings::approve),
+        )
+        .route(
+            "/api/v1/settings/requests/{login}/deny",
+            post(settings::deny),
+        )
+        .layer(middleware::from_fn(origin::same_origin_changes))
+}
+
+pub fn session_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(SESSION_PATH, get(session::session))
+        .route(
+            ACCESS_REQUEST_PATH,
+            post(session::request_access).layer(DefaultBodyLimit::max(4096)),
+        )
         .layer(middleware::from_fn(origin::same_origin_changes))
 }
 

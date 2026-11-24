@@ -1032,5 +1032,6 @@ async fn no_account_with_headroom_is_a_plain_503() {
 mod logs;
 mod models;
 mod proxy;
+mod settings;
 mod web;
 mod websocket;

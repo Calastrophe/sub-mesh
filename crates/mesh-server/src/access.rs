@@ -46,3 +46,39 @@ pub async fn consumer(
         Err(response) => *response,
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    pub peer: Peer,
+    pub consumer: bool,
+}
+
+pub async fn identified(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let caller = match state
+        .peers
+        .check(addr, request.headers(), Role::Consumer)
+        .await
+    {
+        Decision::Allow(peer) => Caller {
+            peer,
+            consumer: true,
+        },
+        Decision::Deny(_) => match state.peers.identify(addr, request.headers()).await {
+            Ok(peer) => Caller {
+                peer,
+                consumer: false,
+            },
+            Err(reason) => {
+                tracing::warn!(%addr, %reason, "refused unidentified caller");
+                return (StatusCode::FORBIDDEN, "forbidden\n").into_response();
+            }
+        },
+    };
+    request.extensions_mut().insert(caller);
+    next.run(request).await
+}

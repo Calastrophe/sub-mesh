@@ -13,9 +13,11 @@ use crate::registry::DaemonRow;
 
 mod log;
 mod schema;
+mod settings;
 mod warmth;
 
 pub use log::{Activity, Completion, LogOwner, RequestRecord};
+pub use settings::{RequestOutcome, StoredEntry, StoredSettings, StoredValue};
 
 fn time_text(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Secs, true)

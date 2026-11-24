@@ -203,7 +203,7 @@ impl<'a> Run<'a> {
             started: Instant::now(),
             attempts: 0,
             session,
-            cache_ttl: state.config.cache_ttl(),
+            cache_ttl: state.tuning().config.cache_ttl(),
             model: None,
             transport,
             method: job.method.as_str().to_owned(),
@@ -276,7 +276,7 @@ impl<'a> Run<'a> {
         &mut self,
         candidates: &mut impl Iterator<Item = Candidate>,
     ) -> Option<(Candidate, mesh_relay::tunnel::Client, InFlightGuard)> {
-        while (self.attempts as usize) < self.state.config.max_attempts {
+        while (self.attempts as usize) < self.state.tuning().config.max_attempts {
             let candidate = candidates.next()?;
             if let Some((client, guard)) = self.start(&candidate) {
                 self.attempts += 1;
@@ -457,7 +457,7 @@ pub(crate) async fn relay_as(
     let body = match http::read_body(
         &parts.headers,
         body,
-        state.config.max_body_bytes,
+        state.tuning().config.max_body_bytes,
         Duration::from_secs(120),
     )
     .await

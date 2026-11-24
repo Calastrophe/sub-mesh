@@ -99,6 +99,11 @@ impl Registry {
         }
     }
 
+    pub fn set_tuning(&mut self, stale_after: TimeDelta, affinity_min_headroom: f64) {
+        self.stale_after = stale_after;
+        self.affinity_min_headroom = affinity_min_headroom;
+    }
+
     /// Fill the registry from the database. Loaded daemons count as stale
     /// until they send a fresh report.
     pub fn load(
