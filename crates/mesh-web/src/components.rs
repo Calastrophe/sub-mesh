@@ -13,6 +13,7 @@ mod topbar;
 pub use header::{EmailToggle, PageHeader};
 pub use icon::{Glyph, Icon};
 pub use loaded::Loaded;
+pub use logo::Logo;
 pub use sidebar::Sidebar;
 pub use table::Table;
 pub use tabs::ProviderTabs;

@@ -7,7 +7,8 @@ use std::time::Duration;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use mesh_core::api::{
-    DEFAULT_USAGE_HOURS, Direction, LogEntry, Overview, Subscription, UsageReport,
+    DEFAULT_USAGE_HOURS, Direction, LogEntry, Overview, Session, SettingsView, Subscription,
+    UsageReport,
 };
 use mesh_core::{AccountId, ModelAllowlist, Provider, ReserveConfig};
 
@@ -80,6 +81,12 @@ pub struct Store {
     pub filter: RwSignal<Filter>,
     pub toasts: RwSignal<Vec<Toast>>,
     next_toast: RwSignal<u32>,
+    pub session: RwSignal<Option<Session>>,
+    pub session_error: RwSignal<bool>,
+    session_loading: RwSignal<bool>,
+    pub settings: RwSignal<Option<SettingsView>>,
+    settings_loading: RwSignal<bool>,
+    pub settings_busy: RwSignal<bool>,
 }
 
 /// The store provided by [`crate::app::App`].
@@ -114,7 +121,123 @@ impl Store {
             filter: RwSignal::new(Filter::All),
             toasts: RwSignal::new(Vec::new()),
             next_toast: RwSignal::new(0),
+            session: RwSignal::new(None),
+            session_error: RwSignal::new(false),
+            session_loading: RwSignal::new(false),
+            settings: RwSignal::new(None),
+            settings_loading: RwSignal::new(false),
+            settings_busy: RwSignal::new(false),
         }
+    }
+
+    pub fn is_admin(self) -> bool {
+        self.session
+            .with(|session| session.as_ref().is_some_and(|session| session.admin))
+    }
+
+    pub fn pending_requests(self) -> u32 {
+        self.session.with(|session| {
+            session
+                .as_ref()
+                .and_then(|session| session.pending_requests)
+                .unwrap_or(0)
+        })
+    }
+
+    pub fn refresh_session(self) {
+        if self.session_loading.get_untracked() {
+            return;
+        }
+        self.session_loading.set(true);
+        spawn_local(async move {
+            let result = api::session().await;
+            if self.session_loading.try_set(false).is_some() {
+                return;
+            }
+            match result {
+                Ok(session) => {
+                    if self
+                        .session
+                        .with_untracked(|known| known.as_ref() != Some(&session))
+                    {
+                        self.session.set(Some(session));
+                    }
+                    self.session_error.set(false);
+                }
+                Err(error) => {
+                    self.session_error.set(true);
+                    if self.session.with_untracked(Option::is_some) {
+                        self.toast(ToastKind::Error, error.to_string());
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn set_session(self, session: Session) {
+        self.session.set(Some(session));
+    }
+
+    pub fn refresh_settings(self) {
+        if self.settings_loading.get_untracked() || !self.is_admin_untracked() {
+            return;
+        }
+        self.settings_loading.set(true);
+        spawn_local(async move {
+            let result = api::settings().await;
+            if self.settings_loading.try_set(false).is_some() {
+                return;
+            }
+            if self.settings_busy.get_untracked() {
+                return;
+            }
+            match result {
+                Ok(view) => {
+                    if self
+                        .settings
+                        .with_untracked(|known| known.as_ref() != Some(&view))
+                    {
+                        self.settings.set(Some(view));
+                    }
+                }
+                Err(error) => self.toast(ToastKind::Error, error.to_string()),
+            }
+        });
+    }
+
+    fn is_admin_untracked(self) -> bool {
+        self.session
+            .with_untracked(|session| session.as_ref().is_some_and(|session| session.admin))
+    }
+
+    pub fn change_settings(
+        self,
+        message: String,
+        call: impl std::future::Future<Output = api::Result<SettingsView>> + 'static,
+        done: impl FnOnce(bool) + 'static,
+    ) {
+        if self.settings_busy.get_untracked() {
+            return;
+        }
+        self.settings_busy.set(true);
+        spawn_local(async move {
+            let result = call.await;
+            if self.settings_busy.try_set(false).is_some() {
+                return;
+            }
+            match result {
+                Ok(view) => {
+                    self.settings.set(Some(view));
+                    self.toast(ToastKind::Info, message);
+                    self.refresh_session();
+                    done(true);
+                }
+                Err(error) => {
+                    self.toast(ToastKind::Error, error.to_string());
+                    done(false);
+                }
+            }
+        });
     }
 
     /// Server time of the latest overview.

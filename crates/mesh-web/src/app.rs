@@ -4,8 +4,10 @@ use leptos::ev;
 use leptos::prelude::*;
 
 use crate::components::{Sidebar, Toasts, TopBar};
-use crate::pages::{DaemonsPage, LogsPage, Page, QuotaPage, UsagePage, UsersPage};
-use crate::state::{Store, ToastKind};
+use crate::pages::{
+    AccessPage, DaemonsPage, LogsPage, Page, QuotaPage, SettingsPage, UsagePage, UsersPage,
+};
+use crate::state::{Store, ToastKind, use_store};
 
 /// How often the data reloads by itself.
 const AUTO_REFRESH: Duration = Duration::from_secs(15);
@@ -21,6 +23,57 @@ pub fn App() -> impl IntoView {
     let store = Store::new();
     provide_context(store);
 
+    store.refresh_session();
+    match set_interval_with_handle(move || store.refresh_session(), AUTO_REFRESH) {
+        Ok(interval) => on_cleanup(move || interval.clear()),
+        Err(_) => store.toast(ToastKind::Error, "Could not start auto-refresh.".to_owned()),
+    }
+    let consumer = Memo::new(move |_| {
+        store
+            .session
+            .with(|session| session.as_ref().map(|session| session.consumer))
+    });
+
+    view! {
+        {move || match consumer.get() {
+            Some(true) => view! { <Dashboard /> }.into_any(),
+            Some(false) => view! { <AccessPage /> }.into_any(),
+            None => view! { <Starting /> }.into_any(),
+        }}
+        <Toasts />
+    }
+}
+
+#[component]
+fn Starting() -> impl IntoView {
+    let store = use_store();
+    view! {
+        <div class="empty">
+            <p>
+                {move || {
+                    if store.session_error.get() { "Could not reach the server." } else { "Loading…" }
+                }}
+            </p>
+            <Show when=move || store.session_error.get()>
+                <button class="btn" on:click=move |_| store.refresh_session()>"Retry"</button>
+            </Show>
+        </div>
+    }
+}
+
+fn refresh_page(store: Store, page: Page) {
+    match page {
+        Page::Logs => store.refresh_logs(),
+        Page::Usage => store.refresh_usage(),
+        Page::Settings => store.refresh_settings(),
+        _ => {}
+    }
+}
+
+#[component]
+fn Dashboard() -> impl IntoView {
+    let store = use_store();
+
     let page = RwSignal::new(current_page());
     let navigation = window_event_listener(ev::hashchange, move |_| page.set(current_page()));
     on_cleanup(move || navigation.remove());
@@ -32,19 +85,17 @@ pub fn App() -> impl IntoView {
     let collapsed = RwSignal::new(narrow);
 
     store.refresh();
-    Effect::new(move |_| match page.get() {
-        Page::Logs => store.refresh_logs(),
-        Page::Usage => store.refresh_usage(),
-        _ => {}
+    Effect::new(move |_| {
+        let page = page.get();
+        let admin = store.is_admin();
+        if page != Page::Settings || admin {
+            refresh_page(store, page);
+        }
     });
     match set_interval_with_handle(
         move || {
             store.refresh();
-            match page.get_untracked() {
-                Page::Logs => store.refresh_logs(),
-                Page::Usage => store.refresh_usage(),
-                _ => {}
-            }
+            refresh_page(store, page.get_untracked());
         },
         AUTO_REFRESH,
     ) {
@@ -64,10 +115,10 @@ pub fn App() -> impl IntoView {
                         Page::Logs => view! { <LogsPage /> }.into_any(),
                         Page::Daemons => view! { <DaemonsPage /> }.into_any(),
                         Page::Users => view! { <UsersPage /> }.into_any(),
+                        Page::Settings => view! { <SettingsPage /> }.into_any(),
                     }}
                 </main>
             </div>
-            <Toasts />
         </div>
     }
 }

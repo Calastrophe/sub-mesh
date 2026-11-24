@@ -1,14 +1,18 @@
 //! One module per dashboard page, plus the page list.
 
+mod access;
 mod daemons;
 mod logs;
 mod quota;
+mod settings;
 mod usage;
 mod users;
 
+pub use access::AccessPage;
 pub use daemons::DaemonsPage;
 pub use logs::LogsPage;
 pub use quota::QuotaPage;
+pub use settings::SettingsPage;
 pub use usage::UsagePage;
 pub use users::UsersPage;
 
@@ -20,6 +24,7 @@ pub enum Page {
     Logs,
     Daemons,
     Users,
+    Settings,
 }
 
 impl Page {
@@ -30,6 +35,7 @@ impl Page {
             Self::Logs => "logs",
             Self::Daemons => "daemons",
             Self::Users => "users",
+            Self::Settings => "settings",
         }
     }
 
@@ -40,6 +46,7 @@ impl Page {
             Self::Logs => "Logs",
             Self::Daemons => "Daemons",
             Self::Users => "Users",
+            Self::Settings => "Settings",
         }
     }
 
@@ -51,6 +58,7 @@ impl Page {
             "logs" => Self::Logs,
             "daemons" => Self::Daemons,
             "users" => Self::Users,
+            "settings" => Self::Settings,
             _ => Self::Quota,
         }
     }
@@ -68,6 +76,7 @@ mod tests {
             Page::Logs,
             Page::Daemons,
             Page::Users,
+            Page::Settings,
         ] {
             assert_eq!(Page::from_hash(&format!("#{}", page.slug())), page);
         }

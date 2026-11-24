@@ -3,10 +3,11 @@ use leptos::prelude::*;
 use super::icon::{Glyph, Icon};
 use super::logo::Logo;
 use crate::pages::Page;
+use crate::state::use_store;
 
 const SECTIONS: [(&str, &[Page]); 2] = [
     ("Overview", &[Page::Quota, Page::Usage, Page::Logs]),
-    ("Mesh", &[Page::Daemons, Page::Users]),
+    ("Mesh", &[Page::Daemons, Page::Users, Page::Settings]),
 ];
 
 fn glyph(page: Page) -> Glyph {
@@ -16,12 +17,14 @@ fn glyph(page: Page) -> Glyph {
         Page::Logs => Glyph::List,
         Page::Daemons => Glyph::Server,
         Page::Users => Glyph::Users,
+        Page::Settings => Glyph::Settings,
     }
 }
 
 /// The left navigation, collapsible to icons only.
 #[component]
 pub fn Sidebar(page: RwSignal<Page>, collapsed: RwSignal<bool>) -> impl IntoView {
+    let store = use_store();
     view! {
         <aside class="sidebar">
             <div class="brand">
@@ -40,9 +43,16 @@ pub fn Sidebar(page: RwSignal<Page>, collapsed: RwSignal<bool>) -> impl IntoView
                                 {pages
                                     .iter()
                                     .map(|&target| {
+                                        let shown = move || target != Page::Settings || store.is_admin();
+                                        let badge = move || {
+                                            let pending = store.pending_requests();
+                                            (target == Page::Settings && pending > 0)
+                                                .then(|| view! { <span class="nav-badge" aria-label="Pending requests">{pending}</span> })
+                                        };
                                         view! {
                                             <a
                                                 class="nav-item"
+                                                class:hidden=move || !shown()
                                                 class:active=move || page.get() == target
                                                 href=format!("#{}", target.slug())
                                                 aria-label=target.title()
@@ -50,6 +60,7 @@ pub fn Sidebar(page: RwSignal<Page>, collapsed: RwSignal<bool>) -> impl IntoView
                                             >
                                                 <Icon glyph=glyph(target) size=18 />
                                                 <span class="nav-label">{target.title()}</span>
+                                                {badge}
                                             </a>
                                         }
                                     })
