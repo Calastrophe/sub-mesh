@@ -188,12 +188,16 @@ impl Tunnel {
         }
     }
 
-    pub async fn with_codex_account(
+    /// Connect with one stored `provider` account named `<provider>-1`.
+    pub async fn with_account(
         state: &Arc<AppState>,
         server: TestServer,
+        provider: Provider,
     ) -> (Self, TokenStore) {
         let store = TokenStore::new(state.settings.accounts_dir());
-        store.save(&stored("codex-1", Provider::Codex)).unwrap();
+        store
+            .save(&stored(&format!("{}-1", provider.as_str()), provider))
+            .unwrap();
         state.reload().await.unwrap();
         (Self::connect(state, server).await, store)
     }

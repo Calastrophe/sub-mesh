@@ -273,6 +273,69 @@ async fn http_returns_the_last_upstream_429_when_no_account_serves() {
 }
 
 #[tokio::test]
+async fn a_claude_throttle_is_passed_on_without_resting_the_account() {
+    let path = "/relay/a/v1/messages";
+    let stub = Stub::new();
+    stub.on(
+        Method::POST,
+        path,
+        Reply::status(429)
+            .header("x-should-retry", "true")
+            .body(r#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}"#),
+    );
+    let claude = AccountReport {
+        provider: Provider::Claude,
+        ..account("a", 0.5)
+    };
+    let state = relay_state(stub.router(), vec![claude]).await;
+    let addr = serve(state.clone()).await;
+    let send = || {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/claude/v1/messages"))
+            .body("{}")
+            .send()
+    };
+    assert_eq!(send().await.unwrap().status(), 429);
+    let view = state
+        .with_registry(|r| r.view(&"a".parse().unwrap(), Utc::now()))
+        .unwrap();
+    assert_eq!(view.cooldown_until, None);
+    stub.on(Method::POST, path, Reply::status(200).body("served"));
+    let response = send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "served");
+    assert_eq!(stub.calls(path), 2);
+}
+
+#[tokio::test]
+async fn a_rejected_claude_subscription_rests() {
+    let path = "/relay/a/v1/messages";
+    let stub = Stub::new();
+    stub.on(
+        Method::POST,
+        path,
+        Reply::status(429).header("anthropic-ratelimit-unified-status", "rejected"),
+    );
+    let claude = AccountReport {
+        provider: Provider::Claude,
+        ..account("a", 0.5)
+    };
+    let state = relay_state(stub.router(), vec![claude]).await;
+    let addr = serve(state.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/claude/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    let view = state
+        .with_registry(|r| r.view(&"a".parse().unwrap(), Utc::now()))
+        .unwrap();
+    assert!(view.cooldown_until.is_some());
+}
+
+#[tokio::test]
 async fn failover_goes_to_the_next_best_score() {
     let stub = relays(vec![
         ("soon", denied()),

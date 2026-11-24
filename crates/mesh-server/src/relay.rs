@@ -105,15 +105,44 @@ fn relay_target(candidate: &Candidate, rest: &str, query: Option<&str>) -> Strin
     target
 }
 
-/// How long an upstream `429` asks us to wait, from `retry-after` seconds.
-fn limited_cooldown(headers: &HeaderMap) -> TimeDelta {
-    headers
+/// The headers in which Claude says whether a subscription, or one of its
+/// account-wide windows, may still send requests. Each is `rejected` once
+/// its usage limit is reached.
+const CLAUDE_LIMIT_STATUSES: [&str; 3] = [
+    "anthropic-ratelimit-unified-status",
+    "anthropic-ratelimit-unified-5h-status",
+    "anthropic-ratelimit-unified-7d-status",
+];
+
+/// Whether an upstream `429` of `provider` says that the account ran out.
+/// A Claude `429` without a rejected [`CLAUDE_LIMIT_STATUSES`] header is a
+/// short throttle of one request, which the client retries by itself.
+fn account_limited(provider: Provider, headers: &HeaderMap) -> bool {
+    match provider {
+        Provider::Claude => CLAUDE_LIMIT_STATUSES.iter().any(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|status| status.trim().eq_ignore_ascii_case("rejected"))
+        }),
+        Provider::Codex => true,
+    }
+}
+
+/// How long an account rests after an upstream `429` of `provider`, from
+/// `retry-after` seconds, or `None` when the account need not rest.
+fn limited_cooldown(provider: Provider, headers: &HeaderMap) -> Option<TimeDelta> {
+    if !account_limited(provider, headers) {
+        return None;
+    }
+    let cooldown = headers
         .get(header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u32>().ok())
         .map_or(DEFAULT_LIMITED_COOLDOWN, |secs| {
             TimeDelta::seconds(i64::from(secs)).min(MAX_LIMITED_COOLDOWN)
-        })
+        });
+    Some(cooldown)
 }
 
 /// `text`, or its first characters and an ellipsis when it has more than
@@ -278,7 +307,10 @@ impl<'a> Run<'a> {
     }
 
     fn upstream_limited(&self, candidate: &Candidate, headers: &HeaderMap) {
-        let cooldown = limited_cooldown(headers);
+        let Some(cooldown) = limited_cooldown(self.provider, headers) else {
+            tracing::info!(account = %candidate.id, "upstream throttled the request");
+            return;
+        };
         tracing::info!(account = %candidate.id, secs = cooldown.num_seconds(), "upstream rate limit");
         let until = Utc::now() + cooldown;
         self.update_candidate(candidate, |registry| {

@@ -9,8 +9,8 @@ use axum::routing::{any, get};
 use futures_util::{SinkExt, StreamExt};
 use http::header::HeaderName;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use mesh_core::ModelAllowlist;
 use mesh_core::protocol::{DENIED_HEADER, DENIED_MODEL, HEADROOM_HEADER, MODEL_HEADER};
+use mesh_core::{ModelAllowlist, Provider};
 use mesh_providers::TokenStore;
 use mesh_relay::FrameHooks;
 use serde_json::json;
@@ -53,7 +53,7 @@ impl Relay {
             ),
             true,
         );
-        let (tunnel, store) = Tunnel::with_codex_account(&state, server).await;
+        let (tunnel, store) = Tunnel::with_account(&state, server, Provider::Codex).await;
         Self {
             state,
             store,
@@ -224,7 +224,7 @@ async fn config_default_models_apply_until_the_account_sets_its_own() {
         ),
         true,
     );
-    let (tunnel, _store) = Tunnel::with_codex_account(&state, server).await;
+    let (tunnel, _store) = Tunnel::with_account(&state, server, Provider::Codex).await;
     let send = |body: &'static str| {
         tunnel
             .request(Method::POST, "/relay/codex-1/ok")
@@ -604,4 +604,57 @@ async fn websocket_to_an_unknown_account_is_refused_over_the_tunnel() {
     };
     assert_eq!(status, StatusCode::NOT_FOUND);
     relay.state.stop_background().await;
+}
+
+#[tokio::test]
+async fn a_claude_throttle_flags_no_window() {
+    let upstream = MockServer::start().await;
+    mock_usage(&upstream).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-should-retry", "true")
+                .insert_header("anthropic-ratelimit-unified-status", "allowed")
+                .insert_header("anthropic-ratelimit-unified-5h-utilization", "0.1")
+                .insert_header("anthropic-ratelimit-unified-7d-utilization", "0.2"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let base = upstream.uri();
+    let server = TestServer::start().await;
+    let state = daemon_state(
+        "relay-claude-throttle",
+        &server.url,
+        "",
+        &format!(
+            r#"
+            [endpoints.claude]
+            upstream_base = "{base}"
+            token_url = "{base}/tokens"
+            usage_url = "{base}/usage"
+            "#
+        ),
+        true,
+    );
+    let (tunnel, _store) = Tunnel::with_account(&state, server, Provider::Claude).await;
+    let response = tunnel
+        .request(Method::POST, "/relay/claude-1/v1/messages")
+        .body("{}")
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(response.headers()[HEADROOM_HEADER], "deny");
+    let report = state.daemon_report();
+    assert!(!report.accounts[0].windows.is_empty());
+    assert!(
+        report.accounts[0]
+            .windows
+            .iter()
+            .all(|window| !window.limited)
+    );
+    state.stop_background().await;
+    upstream.verify().await;
+    let _ = std::fs::remove_dir_all(&state.settings.data_dir);
 }

@@ -20,7 +20,7 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 use mesh_core::protocol::{
     DENIED_HEADER, DENIED_MODEL, HEADROOM_HEADER, HeadroomHint, MODEL_HEADER, RELAY_PREFIX,
 };
-use mesh_core::{AccountId, Admission, DenyReason, Window};
+use mesh_core::{AccountId, Admission, DenyReason, Provider, Window};
 use mesh_providers::{Credentials, ProviderError};
 use mesh_relay::{MeshHeaders, UpstreamSocket};
 use serde::Deserialize;
@@ -188,11 +188,13 @@ impl Call<'_> {
     }
 
     /// Merge windows seen in upstream headers and return the new admission.
+    /// A Claude `429` names its spent windows in its headers, and one that
+    /// names none is a short throttle, so only a Codex `429` flags a window.
     fn learn(&self, headers: &HeaderMap, rate_limited: bool) -> Admission {
         let now = Utc::now();
         let mut windows =
             mesh_providers::parse_rate_limit_headers(self.account.provider, headers, now);
-        if rate_limited {
+        if rate_limited && self.account.provider == Provider::Codex {
             mark_limited(&mut windows);
         }
         if windows.is_empty() {

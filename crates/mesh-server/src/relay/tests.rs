@@ -140,24 +140,54 @@ fn strips_the_provider_prefix() {
 
 #[test]
 fn retry_after_is_capped_with_a_default() {
+    let codex = |pairs| limited_cooldown(Provider::Codex, &headers(pairs));
+    assert_eq!(codex(&[]), Some(DEFAULT_LIMITED_COOLDOWN));
     assert_eq!(
-        limited_cooldown(&HeaderMap::new()),
-        DEFAULT_LIMITED_COOLDOWN
+        codex(&[("retry-after", "120")]),
+        Some(TimeDelta::seconds(120))
     );
     assert_eq!(
-        limited_cooldown(&headers(&[("retry-after", "120")])),
-        TimeDelta::seconds(120)
+        codex(&[("retry-after", "999999")]),
+        Some(MAX_LIMITED_COOLDOWN)
     );
     assert_eq!(
-        limited_cooldown(&headers(&[("retry-after", "999999")])),
-        MAX_LIMITED_COOLDOWN
+        codex(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]),
+        Some(DEFAULT_LIMITED_COOLDOWN)
+    );
+}
+
+#[test]
+fn only_a_rejected_claude_subscription_rests() {
+    let claude = |pairs| limited_cooldown(Provider::Claude, &headers(pairs));
+    assert_eq!(claude(&[]), None);
+    assert_eq!(
+        claude(&[("retry-after", "30"), ("x-should-retry", "true")]),
+        None
     );
     assert_eq!(
-        limited_cooldown(&headers(&[(
-            "retry-after",
-            "Wed, 21 Oct 2026 07:28:00 GMT"
-        )])),
-        DEFAULT_LIMITED_COOLDOWN
+        claude(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ]),
+        None
+    );
+    for name in [
+        "anthropic-ratelimit-unified-status",
+        "anthropic-ratelimit-unified-5h-status",
+        "anthropic-ratelimit-unified-7d-status",
+    ] {
+        assert_eq!(
+            limited_cooldown(Provider::Claude, &headers(&[(name, "rejected")])),
+            Some(DEFAULT_LIMITED_COOLDOWN),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        claude(&[
+            ("anthropic-ratelimit-unified-status", "Rejected"),
+            ("retry-after", "120"),
+        ]),
+        Some(TimeDelta::seconds(120))
     );
 }
 

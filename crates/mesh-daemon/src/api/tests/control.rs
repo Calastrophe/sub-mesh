@@ -3,7 +3,9 @@ use std::time::Duration;
 use http::{Method, StatusCode};
 use mesh_core::api::{SetModels, SetReserve};
 use mesh_core::protocol::{CONTROL_PREFIX, ON_BEHALF_HEADER};
-use mesh_core::{AccountReport, Admission, ApiError, DenyReason, ModelAllowlist, ReserveConfig};
+use mesh_core::{
+    AccountReport, Admission, ApiError, DenyReason, ModelAllowlist, Provider, ReserveConfig,
+};
 use mesh_providers::TokenStore;
 use std::sync::Arc;
 
@@ -23,7 +25,7 @@ impl Control {
         let server = TestServer::start().await;
         let state = daemon_state(name, &server.url, extra, "", true);
         state.set_owner(Some(OWNER.to_owned()));
-        let (tunnel, store) = Tunnel::with_codex_account(&state, server).await;
+        let (tunnel, store) = Tunnel::with_account(&state, server, Provider::Codex).await;
         Self {
             state,
             store,
