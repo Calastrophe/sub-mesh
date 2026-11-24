@@ -1516,7 +1516,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mesh-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "serde",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-providers"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-relay"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "bytes",
@@ -1602,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "meshctl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
