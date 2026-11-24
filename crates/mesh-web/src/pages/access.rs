@@ -2,7 +2,7 @@ use chrono::Utc;
 use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use mesh_core::api::{MAX_ACCESS_NOTE, RequestState};
+use mesh_core::api::{MAX_ACCESS_NOTE, RequestState, check_note};
 
 use crate::api;
 use crate::components::Logo;
@@ -15,14 +15,13 @@ pub fn AccessPage() -> impl IntoView {
     let store = use_store();
     let note = RwSignal::new(String::new());
     let sending = RwSignal::new(false);
-    let login = move || {
-        store.session.with(|session| {
-            session
-                .as_ref()
-                .and_then(|session| session.login.clone())
-                .unwrap_or_default()
-        })
+    let error = RwSignal::new(None::<String>);
+    let known_login = move || {
+        store
+            .session
+            .with(|session| session.as_ref().and_then(|session| session.login.clone()))
     };
+    let login = move || known_login().unwrap_or_default();
     let node = move || {
         store
             .session
@@ -39,9 +38,15 @@ pub fn AccessPage() -> impl IntoView {
         if sending.get_untracked() {
             return;
         }
+        let text = match check_note(&note.get_untracked()) {
+            Ok(text) => text,
+            Err(message) => {
+                error.set(Some(message));
+                return;
+            }
+        };
+        error.set(None);
         sending.set(true);
-        let text = note.get_untracked();
-        let text = (!text.trim().is_empty()).then_some(text);
         spawn_local(async move {
             let result = api::request_access(text).await;
             if sending.try_set(false).is_some() {
@@ -53,20 +58,31 @@ pub fn AccessPage() -> impl IntoView {
             }
         });
     };
-    let body = move || match request() {
+    let body = move || {
+        match request() {
+        None if known_login().is_none() => view! {
+            <p class="muted">
+                "Your login could not be determined, so access cannot be requested from this device."
+            </p>
+        }
+        .into_any(),
         None => view! {
             <form class="access-form" on:submit=submit>
                 <label class="field">
                     <span>"Note"</span>
-                    <textarea
-                        class="model-patterns"
-                        rows="3"
+                    <input
+                        type="text"
                         maxlength=MAX_ACCESS_NOTE.to_string()
+                        autocomplete="off"
                         placeholder="Optional"
                         prop:value=move || note.get()
-                        on:input=move |ev| note.set(event_target_value(&ev))
-                    ></textarea>
+                        on:input=move |ev| {
+                            note.set(event_target_value(&ev));
+                            error.set(None);
+                        }
+                    />
                 </label>
+                {move || error.get().map(|message| view! { <p class="editor-error" role="alert">{message}</p> })}
                 <button class="btn btn-primary" type="submit" prop:disabled=move || sending.get()>
                     "Request access"
                 </button>
@@ -81,12 +97,13 @@ pub fn AccessPage() -> impl IntoView {
             view! {
                 <div class="access-state">
                     <span class=class>{text}</span>
-                    <span class="muted">{format!("Requested {}", ago(Utc::now(), request.requested_at))}</span>
+                    <span class="muted">{format!("Requested {}", ago(store.now().unwrap_or_else(Utc::now), request.requested_at))}</span>
                 </div>
                 {request.note.map(|note| view! { <p class="access-note">{note}</p> })}
             }
             .into_any()
         }
+    }
     };
     view! {
         <div class="access">
@@ -99,13 +116,15 @@ pub fn AccessPage() -> impl IntoView {
                     </div>
                 </div>
                 <h1>"Request access"</h1>
-                <div class="chip">
-                    <span class="avatar">
-                        {move || login().chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()}
-                    </span>
-                    <span class="chip-login">{login}</span>
-                    <span class="chip-node">{node}</span>
-                </div>
+                <Show when=move || known_login().is_some()>
+                    <div class="chip">
+                        <span class="avatar">
+                            {move || login().chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()}
+                        </span>
+                        <span class="chip-login">{login}</span>
+                        <span class="chip-node">{node}</span>
+                    </div>
+                </Show>
                 {body}
             </div>
         </div>

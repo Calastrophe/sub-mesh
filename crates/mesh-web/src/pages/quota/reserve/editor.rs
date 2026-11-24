@@ -1,9 +1,15 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 use mesh_core::{AccountId, ReserveConfig};
 
 use super::form::Fields;
+use crate::components::typed_number;
+use crate::format::slider_position;
 use crate::state::{Action, use_store};
+
+static NEXT_FIELD: AtomicU32 = AtomicU32::new(0);
 
 /// An inline form for a subscription's reserve, in percent. Each field is a
 /// slider beside a number box, and both edit the same value. Empty 5-hour
@@ -53,29 +59,31 @@ pub fn ReserveEditor(
     };
 
     let field = move |label: &'static str, signal: RwSignal<String>, required: bool| {
+        let input_id = format!(
+            "reserve-field-{}",
+            NEXT_FIELD.fetch_add(1, Ordering::Relaxed)
+        );
         view! {
-            <label class="field">
-                <span>{label}</span>
+            <div class="field">
+                <label for=input_id.clone()>{label}</label>
                 <span class="field-input">
                     <input
                         type="range"
                         class="slider"
-                        class:inherited=move || signal.get().trim().is_empty()
+                        class:inherited=move || slider_position(&signal.get(), &default.get()).1
                         min="0"
                         max="100"
                         step="1"
-                        aria-label=label
+                        aria-label=format!("{label} slider")
                         prop:disabled=busy
-                        prop:value=move || {
-                            let own = signal.get();
-                            if own.trim().is_empty() { default.get() } else { own }
-                        }
+                        prop:value=move || slider_position(&signal.get(), &default.get()).0
                         on:input=move |ev| {
                             signal.set(event_target_value(&ev));
                             error.set(None);
                         }
                     />
                     <input
+                        id=input_id
                         type="number"
                         min="0"
                         max="100"
@@ -86,13 +94,15 @@ pub fn ReserveEditor(
                         placeholder=move || (!required).then(|| default.get().trim().to_owned())
                         prop:value=move || signal.get()
                         on:input=move |ev| {
-                            signal.set(event_target_value(&ev));
+                            if let Some(typed) = typed_number(&ev) {
+                                signal.set(typed);
+                            }
                             error.set(None);
                         }
                     />
                     <span class="unit">"%"</span>
                 </span>
-            </label>
+            </div>
         }
     };
 

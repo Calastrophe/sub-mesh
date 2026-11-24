@@ -83,9 +83,13 @@ pub struct Store {
     next_toast: RwSignal<u32>,
     pub session: RwSignal<Option<Session>>,
     pub session_error: RwSignal<bool>,
+    pub session_denied: RwSignal<bool>,
     session_loading: RwSignal<bool>,
+    session_generation: RwSignal<u64>,
     pub settings: RwSignal<Option<SettingsView>>,
     settings_loading: RwSignal<bool>,
+    settings_error: RwSignal<bool>,
+    settings_generation: RwSignal<u64>,
     pub settings_busy: RwSignal<bool>,
 }
 
@@ -123,9 +127,13 @@ impl Store {
             next_toast: RwSignal::new(0),
             session: RwSignal::new(None),
             session_error: RwSignal::new(false),
+            session_denied: RwSignal::new(false),
             session_loading: RwSignal::new(false),
+            session_generation: RwSignal::new(0),
             settings: RwSignal::new(None),
             settings_loading: RwSignal::new(false),
+            settings_error: RwSignal::new(false),
+            settings_generation: RwSignal::new(0),
             settings_busy: RwSignal::new(false),
         }
     }
@@ -149,11 +157,13 @@ impl Store {
             return;
         }
         self.session_loading.set(true);
+        let generation = self.session_generation.get_untracked();
         spawn_local(async move {
             let result = api::session().await;
-            if self.session_loading.try_set(false).is_some() {
+            if self.session_generation.try_get_untracked() != Some(generation) {
                 return;
             }
+            self.session_loading.set(false);
             match result {
                 Ok(session) => {
                     if self
@@ -163,9 +173,17 @@ impl Store {
                         self.session.set(Some(session));
                     }
                     self.session_error.set(false);
+                    self.session_denied.set(false);
                 }
                 Err(error) => {
                     self.session_error.set(true);
+                    self.session_denied.set(matches!(
+                        error,
+                        api::Error::Api {
+                            status: 401 | 403,
+                            ..
+                        }
+                    ));
                     if self.session.with_untracked(Option::is_some) {
                         self.toast(ToastKind::Error, error.to_string());
                     }
@@ -174,23 +192,41 @@ impl Store {
         });
     }
 
+    fn restart_session(self) {
+        self.session_generation
+            .update(|generation| *generation += 1);
+        self.session_loading.set(false);
+        self.refresh_session();
+    }
+
     pub fn set_session(self, session: Session) {
+        self.session_generation
+            .update(|generation| *generation += 1);
+        self.session_loading.set(false);
+        self.session_error.set(false);
+        self.session_denied.set(false);
         self.session.set(Some(session));
     }
 
+    pub fn settings_failed(self) -> bool {
+        self.settings_error.get() && !self.settings_loading.get()
+    }
+
     pub fn refresh_settings(self) {
-        if self.settings_loading.get_untracked() || !self.is_admin_untracked() {
+        if self.settings_loading.get_untracked()
+            || self.settings_busy.get_untracked()
+            || !self.is_admin_untracked()
+        {
             return;
         }
         self.settings_loading.set(true);
+        let generation = self.settings_generation.get_untracked();
         spawn_local(async move {
             let result = api::settings().await;
-            if self.settings_loading.try_set(false).is_some() {
+            if self.settings_generation.try_get_untracked() != Some(generation) {
                 return;
             }
-            if self.settings_busy.get_untracked() {
-                return;
-            }
+            self.settings_loading.set(false);
             match result {
                 Ok(view) => {
                     if self
@@ -199,8 +235,12 @@ impl Store {
                     {
                         self.settings.set(Some(view));
                     }
+                    self.settings_error.set(false);
                 }
-                Err(error) => self.toast(ToastKind::Error, error.to_string()),
+                Err(error) => {
+                    self.settings_error.set(true);
+                    self.toast(ToastKind::Error, error.to_string());
+                }
             }
         });
     }
@@ -220,6 +260,9 @@ impl Store {
             return;
         }
         self.settings_busy.set(true);
+        self.settings_generation
+            .update(|generation| *generation += 1);
+        self.settings_loading.set(false);
         spawn_local(async move {
             let result = call.await;
             if self.settings_busy.try_set(false).is_some() {
@@ -228,8 +271,9 @@ impl Store {
             match result {
                 Ok(view) => {
                     self.settings.set(Some(view));
+                    self.settings_error.set(false);
                     self.toast(ToastKind::Info, message);
-                    self.refresh_session();
+                    self.restart_session();
                     done(true);
                 }
                 Err(error) => {

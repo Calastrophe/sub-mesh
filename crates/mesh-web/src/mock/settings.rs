@@ -3,11 +3,13 @@ use std::cell::RefCell;
 use chrono::{Duration, Utc};
 use mesh_core::api::{
     AccessList, AccessRequest, EntrySource, FixedSettings, ListEntry, ListGroup, ListKind,
-    ProxyInfo, RequestState, Session, SettingName, SettingValue, SettingsView, Tunable,
+    MAX_ACCESS_REQUESTS, ProxyInfo, RequestState, Session, SettingName, SettingValue, SettingsView,
+    Tunable, check_login, check_note,
 };
 
 use super::{BOB, CAROL, ME};
 use crate::api::{Decision, Error, Result};
+use crate::format::check_setting;
 
 const GUEST: &str = "guest@example.com";
 const DAVE: &str = "dave@example.com";
@@ -103,14 +105,12 @@ pub fn request_access(note: Option<String>) -> Result<Session> {
     if visitor() == Visitor::Admin {
         return Err(api_error(409, "you already have access"));
     }
+    check_login(GUEST).map_err(|_| api_error(403, "forbidden"))?;
     let note = note
-        .map(|note| note.trim().to_owned())
-        .filter(|note| !note.is_empty());
-    if note
-        .as_ref()
-        .is_some_and(|note| note.chars().count() > mesh_core::api::MAX_ACCESS_NOTE)
-    {
-        return Err(api_error(400, "the note is too long"));
+        .map_or(Ok(None), |note| check_note(&note))
+        .map_err(|reason| api_error(400, reason))?;
+    if SETTINGS.with_borrow(|view| view.pending()) >= MAX_ACCESS_REQUESTS {
+        return Err(api_error(429, "too many pending access requests"));
     }
     GUEST_REQUEST.with_borrow_mut(|request| {
         if request.is_none() {
@@ -155,9 +155,20 @@ fn web_entry(value: &str, ago: Duration) -> ListEntry {
     }
 }
 
+fn same_entry(kind: ListKind, listed: &str, value: &str) -> bool {
+    match kind {
+        ListKind::Logins => listed.eq_ignore_ascii_case(value),
+        ListKind::Tags => listed == value,
+    }
+}
+
 pub fn set_entry(group: ListGroup, kind: ListKind, value: &str, add: bool) -> Result<SettingsView> {
     admin_only()?;
-    let value = kind.check(value).map_err(|reason| api_error(400, reason))?;
+    let value = if add {
+        kind.check(value).map_err(|reason| api_error(400, reason))?
+    } else {
+        value.trim().to_owned()
+    };
     SETTINGS.with_borrow_mut(|view| {
         if add && group == ListGroup::Consumers && kind == ListKind::Logins {
             view.requests
@@ -166,7 +177,7 @@ pub fn set_entry(group: ListGroup, kind: ListKind, value: &str, add: bool) -> Re
         let list = list_mut(view, group, kind);
         let index = list
             .iter()
-            .position(|entry| entry.value.eq_ignore_ascii_case(&value));
+            .position(|entry| same_entry(kind, &entry.value, &value));
         match (add, index) {
             (true, Some(_)) => {}
             (true, None) => list.push(web_entry(&value, Duration::zero())),
@@ -187,10 +198,18 @@ pub fn set_entry(group: ListGroup, kind: ListKind, value: &str, add: bool) -> Re
 
 pub fn set_value(name: SettingName, value: Option<SettingValue>) -> Result<SettingsView> {
     admin_only()?;
-    let value = value
-        .map(|value| name.check(value).map_err(|reason| api_error(400, reason)))
-        .transpose()?;
     SETTINGS.with_borrow_mut(|view| {
+        let config = view
+            .values
+            .iter()
+            .find(|tunable| tunable.name == name)
+            .map(|tunable| tunable.config)
+            .ok_or_else(|| api_error(404, format!("unknown setting {name}")))?;
+        let value = value
+            .map(|value| {
+                check_setting(name, value, config).map_err(|reason| api_error(400, reason))
+            })
+            .transpose()?;
         let proxy_only = view
             .fixed
             .trusted_proxy
@@ -231,6 +250,10 @@ pub fn set_value(name: SettingName, value: Option<SettingValue>) -> Result<Setti
 
 pub fn decide(login: &str, decision: Decision) -> Result<SettingsView> {
     admin_only()?;
+    let login = login.trim();
+    if decision == Decision::Approve {
+        check_login(login).map_err(|reason| api_error(400, reason))?;
+    }
     SETTINGS.with_borrow_mut(|view| {
         let index = view
             .requests
@@ -394,6 +417,44 @@ mod tests {
             set_entry(ListGroup::Daemons, ListKind::Tags, "mesh", true),
             Err(Error::Api { status: 400, .. })
         ));
+        assert!(matches!(
+            set_entry(
+                ListGroup::Consumers,
+                ListKind::Logins,
+                &BOB.to_uppercase(),
+                false
+            ),
+            Err(Error::Api { status: 409, .. })
+        ));
+        assert!(matches!(
+            set_entry(ListGroup::Consumers, ListKind::Tags, "tag:CI", false),
+            Err(Error::Api { status: 404, .. })
+        ));
+        assert!(matches!(
+            set_entry(
+                ListGroup::Consumers,
+                ListKind::Logins,
+                "nobody@example.com",
+                false
+            ),
+            Err(Error::Api { status: 404, .. })
+        ));
+        let spaced = format!(" {} ", CAROL.to_uppercase());
+        assert!(
+            set_entry(ListGroup::Consumers, ListKind::Logins, &spaced, false)
+                .unwrap()
+                .consumers
+                .logins
+                .iter()
+                .all(|entry| entry.value != CAROL)
+        );
+        assert!(matches!(
+            decide(" bad login ", Decision::Approve),
+            Err(Error::Api { status: 400, .. })
+        ));
+        let denied = decide(&format!(" {} ", ERIN.to_uppercase()), Decision::Deny).unwrap();
+        assert_eq!(denied.pending(), 0);
+        SETTINGS.with_borrow_mut(|view| *view = sample_settings());
         let approved = decide(ERIN, Decision::Approve).unwrap();
         assert!(
             approved
@@ -402,7 +463,7 @@ mod tests {
                 .iter()
                 .any(|entry| entry.value == ERIN)
         );
-        assert_eq!(approved.pending(), 0);
+        assert_eq!(approved.pending(), 1);
         let reset = set_value(SettingName::AffinityMinHeadroom, None).unwrap();
         let headroom = reset
             .values

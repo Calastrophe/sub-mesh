@@ -4,6 +4,8 @@ use mesh_core::api::{SettingKind, SettingValue, Tunable};
 
 use super::values::{label, parse, shown, to_text, unit};
 use crate::api;
+use crate::components::typed_number;
+use crate::format::slider_position;
 use crate::state::use_store;
 
 #[component]
@@ -43,6 +45,7 @@ fn TunableRow(tunable: Tunable, proxy_only: Memo<bool>) -> impl IntoView {
     let name = tunable.name;
     let kind = name.kind();
     let current = tunable.value;
+    let config = tunable.config;
     let text = RwSignal::new(to_text(kind, current));
     let error = RwSignal::new(None::<String>);
     let busy = move || store.settings_busy.get();
@@ -55,14 +58,16 @@ fn TunableRow(tunable: Tunable, proxy_only: Memo<bool>) -> impl IntoView {
     };
     let save = move |ev: SubmitEvent| {
         ev.prevent_default();
-        match parse(name, &text.get_untracked(), current) {
+        match parse(name, &text.get_untracked(), current, config) {
             Ok(value) => send(Some(value)),
             Err(message) => error.set(Some(message)),
         }
     };
     let dirty = move || text.get().trim() != to_text(kind, current);
     let edit = move |ev| {
-        text.set(event_target_value(&ev));
+        if let Some(typed) = typed_number(&ev) {
+            text.set(typed);
+        }
         error.set(None);
     };
 
@@ -75,6 +80,7 @@ fn TunableRow(tunable: Tunable, proxy_only: Memo<bool>) -> impl IntoView {
                     class="toggle"
                     class:active=on
                     type="button"
+                    aria-label=label(name)
                     aria-pressed=on.to_string()
                     title=move || locked().then_some("trusted_proxy.only")
                     prop:disabled=move || busy() || locked()
@@ -91,12 +97,13 @@ fn TunableRow(tunable: Tunable, proxy_only: Memo<bool>) -> impl IntoView {
                     <input
                         type="range"
                         class="slider"
+                        class:inherited=move || slider_position(&text.get(), "").1
                         min="0"
                         max="100"
                         step="0.5"
-                        aria-label=label(name)
+                        aria-label=format!("{} slider", label(name))
                         prop:disabled=busy
-                        prop:value=move || text.get()
+                        prop:value=move || slider_position(&text.get(), "").0
                         on:input=edit
                     />
                 }
@@ -143,6 +150,7 @@ fn TunableRow(tunable: Tunable, proxy_only: Memo<bool>) -> impl IntoView {
                         <button
                             class="btn btn-ghost btn-sm"
                             type="button"
+                            aria-label=format!("Reset {} to config", label(name))
                             prop:disabled=busy
                             on:click=move |_| send(None)
                         >

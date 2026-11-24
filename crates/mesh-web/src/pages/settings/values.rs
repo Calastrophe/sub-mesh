@@ -1,5 +1,7 @@
 use mesh_core::api::{SettingKind, SettingName, SettingValue};
 
+use crate::format::{check_setting, setting_bounds};
+
 const MIB: f64 = 1_048_576.0;
 
 pub fn label(name: SettingName) -> &'static str {
@@ -46,7 +48,12 @@ pub fn shown(kind: SettingKind, value: SettingValue) -> String {
     }
 }
 
-pub fn parse(name: SettingName, text: &str, current: SettingValue) -> Result<SettingValue, String> {
+pub fn parse(
+    name: SettingName,
+    text: &str,
+    current: SettingValue,
+    config: SettingValue,
+) -> Result<SettingValue, String> {
     let kind = name.kind();
     let text = text.trim();
     if text == to_text(kind, current) {
@@ -62,13 +69,13 @@ pub fn parse(name: SettingName, text: &str, current: SettingValue) -> Result<Set
         SettingKind::Seconds | SettingKind::Count => SettingValue::Fraction(number),
         SettingKind::Flag => return Err(format!("{} is on or off", label(name))),
     };
-    name.check(value).map_err(|reason| {
+    check_setting(name, value, config).map_err(|reason| {
         let scale = match kind {
             SettingKind::Fraction => 100.0,
             SettingKind::Bytes => 1.0 / MIB,
             _ => return reason,
         };
-        let (low, high) = name.bounds();
+        let (low, high) = setting_bounds(name, config);
         format!(
             "{} must be between {} and {} {}",
             label(name),
@@ -108,24 +115,64 @@ mod tests {
     fn text_parses_back() {
         let headroom = SettingName::AffinityMinHeadroom;
         let current = SettingValue::Fraction(0.123_456);
-        assert_eq!(parse(headroom, "12.35", current), Ok(current));
+        assert_eq!(parse(headroom, "12.35", current, current), Ok(current));
         assert_eq!(
-            parse(headroom, "25%", current),
+            parse(headroom, "25%", current, current),
             Ok(SettingValue::Fraction(0.25))
         );
-        assert!(parse(headroom, "150", current).is_err());
+        assert!(parse(headroom, "150", current, current).is_err());
         assert_eq!(
-            parse(SettingName::MaxBodyBytes, "16", SettingValue::Whole(1)),
+            parse(
+                SettingName::MaxBodyBytes,
+                "16",
+                SettingValue::Whole(1),
+                SettingValue::Whole(1)
+            ),
             Ok(SettingValue::Whole(16 * 1024 * 1024))
         );
         assert_eq!(
-            parse(SettingName::MaxAttempts, "4", SettingValue::Whole(3)),
+            parse(
+                SettingName::MaxAttempts,
+                "4",
+                SettingValue::Whole(3),
+                SettingValue::Whole(3)
+            ),
             Ok(SettingValue::Whole(4))
         );
-        assert!(parse(SettingName::MaxAttempts, "2.5", SettingValue::Whole(3)).is_err());
-        assert!(parse(SettingName::CacheTtlSecs, "x", SettingValue::Whole(3)).is_err());
-        let error =
-            parse(SettingName::MaxBodyBytes, "0", SettingValue::Whole(1 << 26)).unwrap_err();
-        assert!(error.contains("512 MiB"), "{error}");
+        assert!(
+            parse(
+                SettingName::MaxAttempts,
+                "2.5",
+                SettingValue::Whole(3),
+                SettingValue::Whole(3)
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                SettingName::CacheTtlSecs,
+                "x",
+                SettingValue::Whole(3),
+                SettingValue::Whole(3)
+            )
+            .is_err()
+        );
+        let error = parse(
+            SettingName::MaxBodyBytes,
+            "0",
+            SettingValue::Whole(1 << 26),
+            SettingValue::Whole(1 << 26),
+        )
+        .unwrap_err();
+        assert!(error.contains("128 MiB"), "{error}");
+        assert_eq!(
+            parse(
+                SettingName::MaxBodyBytes,
+                "200",
+                SettingValue::Whole(1 << 26),
+                SettingValue::Whole(256 << 20),
+            ),
+            Ok(SettingValue::Whole(200 << 20))
+        );
     }
 }

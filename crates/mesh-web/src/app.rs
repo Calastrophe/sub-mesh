@@ -51,7 +51,13 @@ fn Starting() -> impl IntoView {
         <div class="empty">
             <p>
                 {move || {
-                    if store.session_error.get() { "Could not reach the server." } else { "Loading…" }
+                    if store.session_denied.get() {
+                        "This device is not identified on the tailnet."
+                    } else if store.session_error.get() {
+                        "Could not reach the server."
+                    } else {
+                        "Loading…"
+                    }
                 }}
             </p>
             <Show when=move || store.session_error.get()>

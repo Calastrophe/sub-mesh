@@ -47,7 +47,7 @@ pub fn Sidebar(page: RwSignal<Page>, collapsed: RwSignal<bool>) -> impl IntoView
                                         let badge = move || {
                                             let pending = store.pending_requests();
                                             (target == Page::Settings && pending > 0)
-                                                .then(|| view! { <span class="nav-badge" aria-label="Pending requests">{pending}</span> })
+                                                .then(|| view! { <span class="nav-badge" aria-hidden="true">{pending}</span> })
                                         };
                                         view! {
                                             <a
@@ -55,7 +55,14 @@ pub fn Sidebar(page: RwSignal<Page>, collapsed: RwSignal<bool>) -> impl IntoView
                                                 class:hidden=move || !shown()
                                                 class:active=move || page.get() == target
                                                 href=format!("#{}", target.slug())
-                                                aria-label=target.title()
+                                                aria-label=move || {
+                                                    let pending = store.pending_requests();
+                                                    if target == Page::Settings && pending > 0 {
+                                                        format!("{}, {pending} pending", target.title())
+                                                    } else {
+                                                        target.title().to_owned()
+                                                    }
+                                                }
                                                 aria-current=move || (page.get() == target).then_some("page")
                                             >
                                                 <Icon glyph=glyph(target) size=18 />

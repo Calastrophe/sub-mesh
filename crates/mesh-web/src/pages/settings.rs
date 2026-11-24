@@ -25,6 +25,15 @@ pub fn SettingsPage() -> impl IntoView {
             return view! { <div class="empty"><p>"Admins only."</p></div> }.into_any();
         }
         if !loaded.get() {
+            if store.settings_failed() {
+                return view! {
+                    <div class="empty">
+                        <p>"Could not load the settings."</p>
+                        <button class="btn" on:click=move |_| store.refresh_settings()>"Retry"</button>
+                    </div>
+                }
+                .into_any();
+            }
             return view! { <div class="empty"><p>"Loading…"</p></div> }.into_any();
         }
         view! {

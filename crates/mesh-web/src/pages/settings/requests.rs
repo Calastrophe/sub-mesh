@@ -25,9 +25,10 @@ pub fn RequestsCard() -> impl IntoView {
     };
     let rows = move || {
         let show = store.show_emails.get();
+        let now = store.now().unwrap_or_else(Utc::now);
         requests()
             .into_iter()
-            .map(|request| request_row(request, show))
+            .map(|request| request_row(request, show, now))
             .collect_view()
     };
     view! {
@@ -47,11 +48,13 @@ pub fn RequestsCard() -> impl IntoView {
     }
 }
 
-fn request_row(request: AccessRequest, show: bool) -> impl IntoView {
+fn request_row(request: AccessRequest, show: bool, now: chrono::DateTime<Utc>) -> impl IntoView {
     let store = use_store();
-    let now = Utc::now();
     let login = StoredValue::new(request.login.clone());
     let name = display_label(&request.login, show);
+    let approve_label = format!("Approve {name}");
+    let deny_label = format!("Deny {name}");
+    let clear_label = format!("Clear {name}");
     let act = move |decision: Decision| {
         let login = login.get_value();
         let shown = display_label(&login, store.show_emails.get_untracked());
@@ -73,11 +76,11 @@ fn request_row(request: AccessRequest, show: bool) -> impl IntoView {
         .unwrap_or_default();
     let second = match request.state {
         RequestState::Pending => view! {
-            <button class="btn btn-sm" prop:disabled=busy on:click=move |_| act(Decision::Deny)>"Deny"</button>
+            <button class="btn btn-sm" aria-label=deny_label prop:disabled=busy on:click=move |_| act(Decision::Deny)>"Deny"</button>
         }
         .into_any(),
         RequestState::Denied => view! {
-            <button class="btn btn-ghost btn-sm" prop:disabled=busy on:click=move |_| act(Decision::Forget)>"Clear"</button>
+            <button class="btn btn-ghost btn-sm" aria-label=clear_label prop:disabled=busy on:click=move |_| act(Decision::Forget)>"Clear"</button>
         }
         .into_any(),
     };
@@ -92,7 +95,7 @@ fn request_row(request: AccessRequest, show: bool) -> impl IntoView {
             </td>
             <td class="num">
                 <div class="row-actions">
-                    <button class="btn btn-primary btn-sm" prop:disabled=busy on:click=move |_| act(Decision::Approve)>
+                    <button class="btn btn-primary btn-sm" aria-label=approve_label prop:disabled=busy on:click=move |_| act(Decision::Approve)>
                         "Approve"
                     </button>
                     {second}

@@ -29,7 +29,7 @@ pub fn AccessListCard(group: ListGroup) -> impl IntoView {
     let store = use_store();
     let rows = move || {
         let show = store.show_emails.get();
-        let now = Utc::now();
+        let now = store.now().unwrap_or_else(Utc::now);
         store.settings.with(|view| {
             let list = view.as_ref()?.list(group);
             let own = list.own_login.then(|| {
@@ -100,6 +100,7 @@ fn entry_row(
         _ => "—".to_owned(),
     };
     let removable = entry.source == EntrySource::Web;
+    let remove_label = format!("Remove {text}");
     let value = entry.value.clone();
     let remove = move |_| {
         let value = value.clone();
@@ -125,7 +126,7 @@ fn entry_row(
                         view! {
                             <button
                                 class="icon-btn"
-                                aria-label="Remove"
+                                aria-label=remove_label
                                 title="Remove"
                                 prop:disabled=move || store.settings_busy.get()
                                 on:click=remove.clone()
