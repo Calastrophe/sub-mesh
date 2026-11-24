@@ -249,8 +249,15 @@ async fn a_claude_stream_is_logged_with_its_tokens() {
     );
     let state = relay_state(stub.router(), vec![claude_account("c")]).await;
     let addr = serve(state.clone()).await;
-    let response = claude_request(addr, r#"{"model":"claude-opus-4","messages":[]}"#).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/claude/v1/messages"))
+        .header("accept-encoding", "gzip, br")
+        .body(r#"{"model":"claude-opus-4","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), CLAUDE_SSE);
+    assert_eq!(stub.seen()[0].headers["accept-encoding"], "identity");
 
     let entries = completed(&state, 1).await;
     let entry = &entries[0];

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use mesh_core::Provider;
@@ -63,14 +63,16 @@ pub(super) async fn relay(run: &mut Run<'_>, job: &Job<'_>, body: Bytes) -> Resp
     let total = candidates.len();
     let mut model_refusals = 0;
     let mut candidates = candidates.into_iter();
+    let mut headers = job.headers.clone();
+    if run.provider == Provider::Claude {
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
     while let Some((candidate, client, guard)) = run.next_attempt(&mut candidates) {
         let target = relay_target(&candidate, job.rest, job.query);
-        let send = client.send(
-            job.method.clone(),
-            &target,
-            job.headers.clone(),
-            body.clone(),
-        );
+        let send = client.send(job.method.clone(), &target, headers.clone(), body.clone());
         let Ok(sent) = tokio::time::timeout(Duration::from_secs(120), send).await else {
             let response =
                 (StatusCode::GATEWAY_TIMEOUT, "upstream response timed out\n").into_response();
