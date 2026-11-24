@@ -11,8 +11,7 @@ use crate::state::{Action, use_store};
 
 static NEXT_FIELD: AtomicU32 = AtomicU32::new(0);
 
-/// An inline form for a subscription's reserve, in percent. Each field is a
-/// slider beside a number box, and both edit the same value. Empty 5-hour
+/// An inline form for a subscription's reserve, in percent. Empty 5-hour
 /// or weekly fields fall back to the default, which they show greyed out; "Reset to default" clears the
 /// subscription's own reserve so the daemon default applies again. With
 /// `five_hour` false the provider has no 5-hour limit: the field is hidden
