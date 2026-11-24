@@ -4,14 +4,15 @@
 //! trusted proxy is known by the login that the proxy names in a header
 //! instead; see [`crate::config::TrustedProxy`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::http::{HeaderMap, HeaderName};
 use mesh_relay::tailscale::{self, LocalClient, WhoIs};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 
 use crate::config::{Config, PeerPolicy};
 
@@ -72,6 +73,13 @@ impl From<&WhoIs> for Peer {
                 .then(|| login.to_owned()),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Grant {
+    Open,
+    Loopback,
+    Who { login: String, tags: Vec<String> },
 }
 
 /// The outcome of a peer check.
@@ -200,6 +208,69 @@ fn decide_proxied(
     admit(&who, policy, own_login)
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Policies {
+    pub consumers: PeerPolicy,
+    pub daemons: PeerPolicy,
+    pub admins: Vec<String>,
+    pub own_consumers: bool,
+    pub own_daemons: bool,
+}
+
+impl Policies {
+    pub fn from_config(config: &Config) -> Policies {
+        let mut consumers = config.consumers.clone();
+        merge_logins(&mut consumers.logins, &config.admins.logins);
+        Policies {
+            consumers,
+            daemons: config.daemons.clone(),
+            admins: config.admins.logins.clone(),
+            own_consumers: config.consumers.logins.is_empty(),
+            own_daemons: config.daemons.logins.is_empty(),
+        }
+    }
+
+    fn for_role(&self, role: Role) -> (&PeerPolicy, bool) {
+        match role {
+            Role::Consumer => (&self.consumers, self.own_consumers),
+            Role::Daemon => (&self.daemons, self.own_daemons),
+        }
+    }
+
+    pub fn is_admin(&self, login: &str) -> bool {
+        self.admins
+            .iter()
+            .any(|admin| admin.eq_ignore_ascii_case(login))
+    }
+}
+
+pub fn merge_logins(into: &mut Vec<String>, more: &[String]) {
+    for login in more {
+        if !into.iter().any(|known| known.eq_ignore_ascii_case(login)) {
+            into.push(login.clone());
+        }
+    }
+}
+
+pub fn merge_tags(into: &mut Vec<String>, more: &[String]) {
+    for tag in more {
+        if !into.contains(tag) {
+            into.push(tag.clone());
+        }
+    }
+}
+
+fn with_own<'a>(policy: &'a PeerPolicy, own_login: Option<&str>) -> Cow<'a, PeerPolicy> {
+    match own_login {
+        Some(own) if !policy.logins.is_empty() => {
+            let mut policy = policy.clone();
+            merge_logins(&mut policy.logins, &[own.to_owned()]);
+            Cow::Owned(policy)
+        }
+        _ => Cow::Borrowed(policy),
+    }
+}
+
 /// Runs peer checks, with a short whois cache.
 pub struct PeerChecker {
     client: LocalClient,
@@ -210,8 +281,8 @@ pub struct PeerChecker {
     proxy_header: HeaderName,
     /// Only the trusted proxy may call; whois is never asked.
     proxy_only: bool,
-    consumers: PeerPolicy,
-    daemons: PeerPolicy,
+    policies: RwLock<Arc<Policies>>,
+    revision: watch::Sender<u64>,
     own_login: OnceCell<String>,
     cache: Mutex<HashMap<IpAddr, (Instant, WhoIs)>>,
 }
@@ -229,8 +300,8 @@ impl PeerChecker {
                 .collect(),
             proxy_header: config.trusted_proxy.header_name(),
             proxy_only: config.trusted_proxy.only,
-            consumers: config.consumers.clone(),
-            daemons: config.daemons.clone(),
+            policies: RwLock::new(Arc::new(Policies::from_config(config))),
+            revision: watch::Sender::new(0),
             own_login: OnceCell::new(),
             cache: Mutex::new(HashMap::new()),
         }
@@ -246,38 +317,171 @@ impl PeerChecker {
         self.proxies.contains(&addr.ip().to_canonical())
     }
 
+    pub fn policies(&self) -> Arc<Policies> {
+        self.policies
+            .read()
+            .expect("policies lock poisoned")
+            .clone()
+    }
+
+    pub fn set_policies(&self, policies: Policies) {
+        *self.policies.write().expect("policies lock poisoned") = Arc::new(policies);
+        self.revision.send_modify(|revision| *revision += 1);
+    }
+
+    pub fn skips_whois(&self) -> bool {
+        self.skip_whois
+    }
+
+    pub fn is_admin(&self, peer: &Peer) -> bool {
+        self.skip_whois
+            || peer
+                .login
+                .as_deref()
+                .is_some_and(|login| self.policies().is_admin(login))
+    }
+
     /// Check the peer at `addr`, which sent `headers`, for `role`.
     pub async fn check(&self, addr: SocketAddr, headers: &HeaderMap, role: Role) -> Decision {
-        let policy = match role {
-            Role::Consumer => &self.consumers,
-            Role::Daemon => &self.daemons,
-        };
+        match self.check_grant(addr, headers, role).await {
+            Ok((peer, _)) => Decision::Allow(peer),
+            Err(reason) => Decision::Deny(reason),
+        }
+    }
+
+    pub async fn check_grant(
+        &self,
+        addr: SocketAddr,
+        headers: &HeaderMap,
+        role: Role,
+    ) -> Result<(Peer, Grant), String> {
+        let policies = self.policies();
+        let (policy, own_fallback) = policies.for_role(role);
         if self.skip_whois {
-            return Decision::Allow(Peer::anonymous(&addr.ip().to_canonical().to_string()));
+            return Ok((
+                Peer::anonymous(&addr.ip().to_canonical().to_string()),
+                Grant::Open,
+            ));
         }
         if self.is_proxy(addr) {
-            let own_login = if policy.logins.is_empty() {
+            let own_login = if own_fallback {
                 self.own_login().await
             } else {
                 None
             };
-            return decide_proxied(headers, &self.proxy_header, policy, own_login);
+            let policy = with_own(policy, own_login);
+            return match decide_proxied(headers, &self.proxy_header, &policy, own_login) {
+                Decision::Allow(peer) => {
+                    let grant = Grant::Who {
+                        login: peer.login.clone().unwrap_or_default(),
+                        tags: Vec::new(),
+                    };
+                    Ok((peer, grant))
+                }
+                Decision::Deny(reason) => Err(reason),
+            };
         }
         if loopback_allowed(addr, policy) {
-            return Decision::Allow(Peer::anonymous("loopback"));
+            return Ok((Peer::anonymous("loopback"), Grant::Loopback));
         }
         if self.proxy_only {
-            return Decision::Deny(format!(
+            return Err(format!(
                 "{addr} is not the trusted proxy, and trusted_proxy.only is set"
             ));
         }
-        let own_login = if policy.logins.is_empty() {
+        let own_login = if own_fallback {
             self.own_login().await
         } else {
             None
         };
+        let policy = with_own(policy, own_login);
         let who = self.whois(addr).await;
-        decide(who.as_ref(), addr, policy, own_login)
+        match decide(who.as_ref(), addr, &policy, own_login) {
+            Decision::Allow(peer) => {
+                let grant = match &who {
+                    Ok(who) => Grant::Who {
+                        login: who.login_name.trim().to_owned(),
+                        tags: who.tags.clone(),
+                    },
+                    Err(_) => Grant::Loopback,
+                };
+                Ok((peer, grant))
+            }
+            Decision::Deny(reason) => Err(reason),
+        }
+    }
+
+    pub fn admits(&self, grant: &Grant, role: Role) -> bool {
+        if self.skip_whois {
+            return true;
+        }
+        let policies = self.policies();
+        let (policy, own_fallback) = policies.for_role(role);
+        match grant {
+            Grant::Open => true,
+            Grant::Loopback => policy.allow_loopback,
+            Grant::Who { login, tags } => {
+                let own_login = if own_fallback {
+                    self.own_login.get().map(String::as_str)
+                } else {
+                    None
+                };
+                let policy = with_own(policy, own_login);
+                let who = WhoIs {
+                    login_name: login.clone(),
+                    node_name: String::new(),
+                    tags: tags.clone(),
+                };
+                let admitted = matches!(admit(&who, &policy, own_login), Decision::Allow(_));
+                admitted || (own_fallback && self.own_login.get().is_none())
+            }
+        }
+    }
+
+    pub fn admits_login(&self, login: &str, role: Role) -> bool {
+        self.admits(
+            &Grant::Who {
+                login: login.to_owned(),
+                tags: Vec::new(),
+            },
+            role,
+        )
+    }
+
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    pub async fn identify(&self, addr: SocketAddr, headers: &HeaderMap) -> Result<Peer, String> {
+        if self.skip_whois {
+            return Err("insecure_skip_whois leaves callers without a login".to_owned());
+        }
+        if self.is_proxy(addr) {
+            let login = proxy_login(headers, &self.proxy_header)?;
+            if cross_site(headers) {
+                return Err(format!(
+                    "a page of another site sent a request as {login} through the trusted proxy"
+                ));
+            }
+            return Ok(Peer {
+                node: PROXY_NODE.to_owned(),
+                login: Some(login.to_owned()),
+            });
+        }
+        if self.proxy_only {
+            return Err(format!(
+                "{addr} is not the trusted proxy, and trusted_proxy.only is set"
+            ));
+        }
+        let who = self
+            .whois(addr)
+            .await
+            .map_err(|error| format!("whois failed for {addr}: {error}"))?;
+        let peer = Peer::from(&who);
+        if peer.login.is_none() {
+            return Err(format!("{} has no user login", who.node_name));
+        }
+        Ok(peer)
     }
 
     async fn own_login(&self) -> Option<&str> {

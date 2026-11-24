@@ -50,6 +50,12 @@ pub struct TrustedProxy {
     pub only: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Admins {
+    pub logins: Vec<String>,
+}
+
 impl Default for TrustedProxy {
     fn default() -> Self {
         TrustedProxy {
@@ -89,6 +95,7 @@ pub struct Config {
     pub consumers: PeerPolicy,
     /// Who may send daemon reports.
     pub daemons: PeerPolicy,
+    pub admins: Admins,
     /// A reverse proxy whose identity header is trusted for consumer and
     /// daemon requests. Off by default.
     pub trusted_proxy: TrustedProxy,
@@ -112,6 +119,7 @@ impl Default for Config {
             tailscale_socket: PathBuf::from(tailscale::DEFAULT_SOCKET),
             consumers: PeerPolicy::default(),
             daemons: PeerPolicy::default(),
+            admins: Admins::default(),
             trusted_proxy: TrustedProxy::default(),
             insecure_skip_whois: false,
             web_dir: default_web_dir(),
@@ -154,6 +162,30 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if HeaderName::from_bytes(self.trusted_proxy.header.as_bytes()).is_err() {
+            bail!(
+                "trusted_proxy.header {:?} is not a header name",
+                self.trusted_proxy.header
+            );
+        }
+        for login in &self.admins.logins {
+            if let Err(reason) = mesh_core::api::check_login(login) {
+                bail!("admins.logins: {login:?}: {reason}");
+            }
+        }
+        self.validate_settings()?;
+        if let Some(dir) = &self.web_dir {
+            if !dir.is_dir() {
+                bail!("web_dir {} is not a directory", dir.display());
+            }
+            if !dir.join("index.html").is_file() {
+                bail!("web_dir {} has no index.html", dir.display());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_settings(&self) -> anyhow::Result<()> {
         if self.max_attempts == 0 {
             bail!("max_attempts must be at least 1");
         }
@@ -163,11 +195,8 @@ impl Config {
         if !(0.0..=1.0).contains(&self.affinity_min_headroom) {
             bail!("affinity_min_headroom must be between 0 and 1");
         }
-        if HeaderName::from_bytes(self.trusted_proxy.header.as_bytes()).is_err() {
-            bail!(
-                "trusted_proxy.header {:?} is not a header name",
-                self.trusted_proxy.header
-            );
+        if TimeDelta::from_std(self.daemon_stale()).is_err() {
+            bail!("daemon_stale_secs is too large");
         }
         if self.trusted_proxy.only {
             if self.insecure_skip_whois {
@@ -187,14 +216,6 @@ impl Config {
                     "trusted_proxy.only needs consumers.logins and daemons.logins: \
                      without tailscaled the server cannot learn its own login"
                 );
-            }
-        }
-        if let Some(dir) = &self.web_dir {
-            if !dir.is_dir() {
-                bail!("web_dir {} is not a directory", dir.display());
-            }
-            if !dir.join("index.html").is_file() {
-                bail!("web_dir {} has no index.html", dir.display());
             }
         }
         Ok(())
@@ -387,6 +408,42 @@ mod tests {
             "insecure_skip_whois = true\n[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]\n[daemons]\nlogins = [\"a\"]",
             "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]\nallow_loopback = true\n[daemons]\nlogins = [\"a\"]",
             "[trusted_proxy]\naddrs = [\"10.0.0.1\"]\nonly = true\n[consumers]\nlogins = [\"a\"]\n[daemons]\nlogins = [\"a\"]\nallow_loopback = true",
+        ] {
+            assert!(Config::from_toml(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn admins_are_plain_logins() {
+        let config = Config::from_toml(
+            r#"
+            listen = "10.10.10.102:7070"
+            [consumers]
+            logins = ["vablings@github", "Calastrophe@github"]
+            [daemons]
+            logins = ["vablings@github", "Calastrophe@github"]
+            [admins]
+            logins = ["vablings@github"]
+            [trusted_proxy]
+            addrs = ["10.10.10.111"]
+            only = true
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(config.admins.logins, ["vablings@github"]);
+        assert!(
+            Config::from_toml("")
+                .expect("parse")
+                .admins
+                .logins
+                .is_empty()
+        );
+        for bad in [
+            "[admins]\nlogins = [\"\"]",
+            "[admins]\nlogins = [\"tagged-devices\"]",
+            "[admins]\nlogins = [\"a b\"]",
+            "[admins]\nlogins = \"a\"",
+            "[admins]\ntags = [\"tag:mesh\"]",
         ] {
             assert!(Config::from_toml(bad).is_err(), "{bad}");
         }

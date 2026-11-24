@@ -29,14 +29,15 @@ use mesh_relay::MeshHeaders;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::access::authorize;
+use crate::access::authorize_grant;
 use crate::db::RequestRecord;
 use crate::log::Entry;
-use crate::peer::{Peer, Role};
+use crate::peer::{Grant, Peer, Role};
 use crate::registry::{
     Caller, Candidate, DAEMON_COOLDOWN, DEFAULT_LIMITED_COOLDOWN, DENIED_COOLDOWN, InFlightGuard,
     Registry,
 };
+use crate::settings::Effective;
 use tracker::Tracker;
 
 /// The longest rest an upstream `retry-after` can impose.
@@ -163,6 +164,7 @@ fn headroom_hint(headers: &HeaderMap) -> Option<HeadroomHint> {
 /// State shared by the attempts of one consumer request.
 struct Run<'a> {
     state: &'a AppState,
+    tuning: Arc<Effective>,
     provider: Provider,
     peer: Peer,
     started: Instant,
@@ -184,6 +186,7 @@ struct Run<'a> {
 impl<'a> Run<'a> {
     fn new(
         state: &'a AppState,
+        tuning: Arc<Effective>,
         provider: Provider,
         peer: Peer,
         session: Option<String>,
@@ -198,12 +201,13 @@ impl<'a> Run<'a> {
             .filter(|agent| !agent.is_empty());
         Run {
             state,
+            cache_ttl: tuning.config.cache_ttl(),
+            tuning,
             provider,
             peer,
             started: Instant::now(),
             attempts: 0,
             session,
-            cache_ttl: state.config.cache_ttl(),
             model: None,
             transport,
             method: job.method.as_str().to_owned(),
@@ -276,7 +280,7 @@ impl<'a> Run<'a> {
         &mut self,
         candidates: &mut impl Iterator<Item = Candidate>,
     ) -> Option<(Candidate, mesh_relay::tunnel::Client, InFlightGuard)> {
-        while (self.attempts as usize) < self.state.config.max_attempts {
+        while (self.attempts as usize) < self.tuning.config.max_attempts {
             let candidate = candidates.next()?;
             if let Some((client, guard)) = self.start(&candidate) {
                 self.attempts += 1;
@@ -413,8 +417,8 @@ async fn relay(
     upgrade: Upgrade,
     request: Request,
 ) -> Response {
-    match authorize(state, addr, request.headers(), Role::Consumer).await {
-        Ok(peer) => relay_as(state, provider, peer, upgrade, request).await,
+    match authorize_grant(state, addr, request.headers(), Role::Consumer).await {
+        Ok((peer, grant)) => relay_as(state, provider, peer, grant, upgrade, request).await,
         Err(response) => *response,
     }
 }
@@ -424,9 +428,11 @@ pub(crate) async fn relay_as(
     state: &Arc<AppState>,
     provider: Provider,
     peer: Peer,
+    grant: Grant,
     upgrade: Upgrade,
     request: Request,
 ) -> Response {
+    let tuning = state.tuning();
     let (parts, body) = request.into_parts();
     let session = affinity::from_headers(provider, &parts.headers);
     let rest = upstream_path(parts.uri.path(), provider);
@@ -444,12 +450,28 @@ pub(crate) async fn relay_as(
     };
     let mut run = match upgrade {
         Ok(upgrade) => {
-            return websocket::relay(state.clone(), provider, peer, session, &job, upgrade);
+            return websocket::relay(
+                state.clone(),
+                tuning,
+                provider,
+                (peer, grant),
+                session,
+                &job,
+                upgrade,
+            );
         }
         Err(error) if mesh_relay::is_websocket_upgrade(&parts.headers) => {
             return error.into_response();
         }
-        Err(_) => Run::new(state, provider, peer, session, Transport::Http, &job),
+        Err(_) => Run::new(
+            state,
+            tuning.clone(),
+            provider,
+            peer,
+            session,
+            Transport::Http,
+            &job,
+        ),
     };
     if models::is_list(provider, &job.method, rest) {
         return models::serve(&mut run, &job).await;
@@ -457,7 +479,7 @@ pub(crate) async fn relay_as(
     let body = match http::read_body(
         &parts.headers,
         body,
-        state.config.max_body_bytes,
+        tuning.config.max_body_bytes,
         Duration::from_secs(120),
     )
     .await

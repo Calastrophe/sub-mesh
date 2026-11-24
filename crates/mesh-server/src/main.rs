@@ -11,6 +11,7 @@ mod peer;
 mod registry;
 mod relay;
 mod report;
+mod settings;
 mod tunnel;
 mod web;
 
@@ -35,6 +36,7 @@ use crate::db::Db;
 use crate::log::Log;
 use crate::peer::PeerChecker;
 use crate::registry::Registry;
+use crate::settings::{Effective, Settings};
 
 /// How long to keep logged requests.
 const REQUEST_RETENTION: TimeDelta = TimeDelta::days(LOG_RETENTION_DAYS as i64);
@@ -68,16 +70,51 @@ pub struct AppState {
     reports: Mutex<()>,
     pub db: Db,
     pub peers: PeerChecker,
+    pub settings: Settings,
     request_log: Log,
     /// The connection of each daemon's current tunnel, with its generation.
     /// The registry decides which generation is current; see
     /// [`AppState::attach_tunnel`].
-    clients: Mutex<HashMap<String, (u64, mesh_relay::tunnel::Client)>>,
+    clients: Mutex<HashMap<String, tunnel::Tunnel>>,
     /// The merged model lists that the server has answered clients with.
     model_lists: relay::ModelLists,
 }
 
 impl AppState {
+    fn new(
+        config: Config,
+        db: Db,
+        registry: Registry,
+        model_lists: relay::ModelLists,
+    ) -> anyhow::Result<Arc<AppState>> {
+        let settings =
+            Settings::load(&config, &db, Utc::now()).context("cannot load web-managed settings")?;
+        let state = AppState {
+            peers: PeerChecker::new(&config),
+            settings,
+            config,
+            registry: Mutex::new(registry),
+            reports: Mutex::new(()),
+            request_log: Log::start(db.clone())?,
+            db,
+            clients: Mutex::new(HashMap::new()),
+            model_lists,
+        };
+        state.install(&state.settings.effective());
+        Ok(Arc::new(state))
+    }
+
+    pub fn tuning(&self) -> Arc<Effective> {
+        self.settings.effective()
+    }
+
+    pub fn install(&self, effective: &Effective) {
+        self.peers.set_policies(effective.policies.clone());
+        let stale_after = effective.stale_after();
+        let headroom = effective.config.affinity_min_headroom;
+        self.with_registry(|registry| registry.set_tuning(stale_after, headroom));
+    }
+
     /// Run `work` on the registry. Never hold the lock across an await.
     pub fn with_registry<T>(&self, work: impl FnOnce(&mut Registry) -> T) -> T {
         let mut registry = self.registry.lock().expect("registry mutex poisoned");
@@ -117,6 +154,10 @@ fn router(state: Arc<AppState>) -> Router {
         state.clone(),
         access::consumer,
     ));
+    let session = api::session_routes().layer(middleware::from_fn_with_state(
+        state.clone(),
+        access::identified,
+    ));
     let web = web::routes(state.config.web_dir.as_deref());
     Router::new()
         .route(protocol::REPORT_PATH, post(report::report))
@@ -125,6 +166,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/claude/{*path}", any(relay::claude))
         .route("/codex/{*path}", any(relay::codex))
         .merge(api)
+        .merge(session)
         .merge(web)
         .with_state(state)
 }
@@ -149,16 +191,7 @@ fn build_state(config: Config) -> anyhow::Result<Arc<AppState>> {
         db.load_warmth(Utc::now())
             .context("cannot load cache warmth")?,
     );
-    Ok(Arc::new(AppState {
-        peers: PeerChecker::new(&config),
-        config,
-        registry: Mutex::new(registry),
-        reports: Mutex::new(()),
-        request_log: Log::start(db.clone())?,
-        db,
-        clients: Mutex::new(HashMap::new()),
-        model_lists: relay::ModelLists::default(),
-    }))
+    AppState::new(config, db, registry, relay::ModelLists::default())
 }
 
 /// Housekeeping: expire cold caches and cooldowns, and delete request log
@@ -179,6 +212,10 @@ async fn maintain(state: Arc<AppState>) {
             match state.db.run(move |db| db.prune_requests(cutoff)).await {
                 Ok(count) => tracing::debug!(count, "pruned old request log rows"),
                 Err(error) => tracing::warn!(%error, "cannot prune request logs"),
+            }
+            let cutoff = now - settings::DENIED_RETENTION;
+            if let Err(error) = state.db.run(move |db| db.expire_denied(cutoff)).await {
+                tracing::warn!(%error, "cannot expire denied access requests");
             }
         }
         ticks += 1;

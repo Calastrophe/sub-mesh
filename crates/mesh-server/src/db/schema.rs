@@ -1,4 +1,4 @@
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 /// The version of the tables, kept in `PRAGMA user_version`.
 ///
@@ -60,7 +60,58 @@ CREATE TABLE IF NOT EXISTS cache_warmth (
     ttl_secs   INTEGER NOT NULL CHECK (ttl_secs BETWEEN 1 AND 4294967295),
     PRIMARY KEY (provider, scope_kind, scope)
 );
+CREATE TABLE IF NOT EXISTS access_entries (
+    list     TEXT NOT NULL,
+    value    TEXT NOT NULL,
+    added_by TEXT,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (list, value)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS access_entries_logins
+    ON access_entries (list, value COLLATE NOCASE)
+    WHERE list IN ('consumers.logins', 'daemons.logins');
+CREATE TABLE IF NOT EXISTS setting_overrides (
+    name   TEXT PRIMARY KEY,
+    value  TEXT NOT NULL,
+    set_by TEXT,
+    set_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS access_requests (
+    login        TEXT PRIMARY KEY COLLATE NOCASE,
+    note         TEXT,
+    state        TEXT NOT NULL CHECK (state IN ('pending', 'denied')),
+    requested_at TEXT NOT NULL,
+    decided_by   TEXT,
+    decided_at   TEXT
+);
 ";
+
+fn exact_access_values(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    let sql: Option<String> = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'access_entries'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if sql.is_some_and(|sql| sql.contains("NOCASE")) {
+        tracing::info!("making web-managed tags case-sensitive");
+        tx.execute_batch(
+            "ALTER TABLE access_entries RENAME TO access_entries_nocase;
+             CREATE TABLE access_entries (
+                 list     TEXT NOT NULL,
+                 value    TEXT NOT NULL,
+                 added_by TEXT,
+                 added_at TEXT NOT NULL,
+                 PRIMARY KEY (list, value)
+             );
+             INSERT INTO access_entries (list, value, added_by, added_at)
+                 SELECT list, value, added_by, added_at FROM access_entries_nocase;
+             DROP TABLE access_entries_nocase;",
+        )?;
+    }
+    Ok(())
+}
 
 /// Create the tables, serialized even across concurrent starts. A database
 /// of an older [`VERSION`] gets a fresh request log.
@@ -71,6 +122,7 @@ pub(super) fn initialize(conn: &mut Connection) -> anyhow::Result<()> {
     if outdated {
         tx.execute_batch("DROP TABLE IF EXISTS requests;")?;
     }
+    exact_access_values(&tx)?;
     tx.execute_batch(SCHEMA)?;
     if outdated {
         tx.pragma_update(None, "user_version", VERSION)?;

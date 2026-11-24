@@ -15,6 +15,10 @@ use mesh_core::{
 
 use crate::api::{Error, Result};
 
+mod settings;
+
+pub use settings::{decide, request_access, session, set_entry, set_value, settings};
+
 const ME: &str = "alice@example.com";
 const BOB: &str = "bob@example.com";
 const CAROL: &str = "carol@example.com";

@@ -98,6 +98,24 @@ async fn forward(
 /// the node `laptop`, and counts the whois calls.
 #[cfg(unix)]
 pub fn fake_tailscaled(login: &'static str) -> (PathBuf, Arc<AtomicUsize>) {
+    fake_whois(move |_| Some(login))
+}
+
+#[cfg(unix)]
+pub fn fake_tailnet(peers: &'static [(&'static str, &'static str)]) -> PathBuf {
+    fake_whois(move |ip| {
+        peers
+            .iter()
+            .find(|(known, _)| *known == ip)
+            .map(|(_, login)| *login)
+    })
+    .0
+}
+
+#[cfg(unix)]
+fn fake_whois(
+    answer: impl Fn(&str) -> Option<&'static str> + Send + Sync + 'static,
+) -> (PathBuf, Arc<AtomicUsize>) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
         "mesh-server-ts-{}-{}.sock",
@@ -108,10 +126,12 @@ pub fn fake_tailscaled(login: &'static str) -> (PathBuf, Arc<AtomicUsize>) {
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
+    let answer = Arc::new(answer);
     tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let counter = counter.clone();
+            let answer = answer.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buf = [0u8; 1024];
@@ -124,13 +144,30 @@ pub fn fake_tailscaled(login: &'static str) -> (PathBuf, Arc<AtomicUsize>) {
                 }
                 assert!(request.starts_with(b"GET /localapi/v0/whois?"));
                 counter.fetch_add(1, Ordering::SeqCst);
-                let body = format!(
-                    r#"{{"Node":{{"Name":"laptop.ts.net.","ComputedName":"laptop"}},"UserProfile":{{"LoginName":"{login}"}}}}"#
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let line = String::from_utf8_lossy(&request);
+                let ip = line
+                    .split("addr=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['%', ':', ' ']).next())
+                    .unwrap_or_default()
+                    .to_owned();
+                let response = match answer(&ip) {
+                    Some(login) => {
+                        let tags = if login == "tagged-devices" {
+                            r#","Tags":["tag:mesh"]"#
+                        } else {
+                            ""
+                        };
+                        let body = format!(
+                            r#"{{"Node":{{"Name":"laptop.ts.net.","ComputedName":"laptop"{tags}}},"UserProfile":{{"LoginName":"{login}"}}}}"#
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\nno peer".to_owned(),
+                };
                 stream.write_all(response.as_bytes()).await.unwrap();
             });
         }

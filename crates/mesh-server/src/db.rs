@@ -13,9 +13,11 @@ use crate::registry::DaemonRow;
 
 mod log;
 mod schema;
+mod settings;
 mod warmth;
 
 pub use log::{Activity, Completion, LogOwner, RequestRecord};
+pub use settings::{RequestOutcome, StoredEntry, StoredSettings, StoredValue};
 
 fn time_text(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -108,6 +110,17 @@ impl Db {
                     stamp
                 ],
             )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn forget_daemons(&self, nodes: &[String]) -> anyhow::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for node in nodes {
+            tx.execute("DELETE FROM accounts WHERE node = ?1", [node])?;
+            tx.execute("DELETE FROM daemons WHERE node = ?1", [node])?;
         }
         tx.commit()?;
         Ok(())

@@ -3,7 +3,7 @@
 use std::fmt::Display;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use mesh_core::api::Subscription;
+use mesh_core::api::{SettingName, SettingValue, Subscription};
 use mesh_core::{Window, WindowClass};
 
 const MASK: &str = "•••";
@@ -36,6 +36,43 @@ pub fn span(duration: Duration) -> String {
             1 => "1 day".to_owned(),
             days => format!("{days} days"),
         },
+    }
+}
+
+pub fn setting_bounds(name: SettingName, config: SettingValue) -> (f64, f64) {
+    let (low, high) = name.bounds();
+    if name == SettingName::MaxBodyBytes {
+        (low, high.max(config.as_f64()))
+    } else {
+        (low, high)
+    }
+}
+
+pub fn check_setting(
+    name: SettingName,
+    value: SettingValue,
+    config: SettingValue,
+) -> Result<SettingValue, String> {
+    let checked = name.check(value);
+    let number = value.as_f64();
+    let (_, high) = setting_bounds(name, config);
+    if checked.is_err()
+        && name == SettingName::MaxBodyBytes
+        && number > name.bounds().1
+        && number <= high
+        && number.fract() == 0.0
+    {
+        return Ok(SettingValue::Whole(number as u64));
+    }
+    checked
+}
+
+pub fn slider_position(own: &str, fallback: &str) -> (String, bool) {
+    let number = |text: &str| text.trim().parse::<f64>().ok().filter(|n| n.is_finite());
+    match (number(own), number(fallback)) {
+        (Some(_), _) => (own.trim().to_owned(), false),
+        (None, Some(_)) => (fallback.trim().to_owned(), true),
+        (None, None) => ("0".to_owned(), true),
     }
 }
 
@@ -223,6 +260,33 @@ mod tests {
         assert_eq!(span(Duration::minutes(185)), "3h 5m");
         assert_eq!(span(Duration::hours(25)), "1 day");
         assert_eq!(span(Duration::hours(100)), "4 days");
+    }
+
+    #[test]
+    fn sliders_fall_back_to_the_minimum() {
+        assert_eq!(slider_position("12", "5"), ("12".to_owned(), false));
+        assert_eq!(slider_position("", "5"), ("5".to_owned(), true));
+        assert_eq!(slider_position("1e", ""), ("0".to_owned(), true));
+        assert_eq!(slider_position("-", "x"), ("0".to_owned(), true));
+    }
+
+    #[test]
+    fn body_limit_rises_to_the_config_value() {
+        let name = SettingName::MaxBodyBytes;
+        let config = SettingValue::Whole(256 << 20);
+        assert_eq!(
+            check_setting(name, SettingValue::Whole(200 << 20), config),
+            Ok(SettingValue::Whole(200 << 20))
+        );
+        assert!(check_setting(name, SettingValue::Whole(300 << 20), config).is_err());
+        assert!(
+            check_setting(
+                name,
+                SettingValue::Whole(200 << 20),
+                SettingValue::Whole(64 << 20)
+            )
+            .is_err()
+        );
     }
 
     #[test]

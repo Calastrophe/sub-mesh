@@ -99,6 +99,34 @@ impl Registry {
         }
     }
 
+    pub fn set_tuning(&mut self, stale_after: TimeDelta, affinity_min_headroom: f64) {
+        self.stale_after = stale_after;
+        self.affinity_min_headroom = affinity_min_headroom;
+    }
+
+    pub fn drop_daemons(
+        &mut self,
+        mut drop: impl FnMut(&str, Option<&str>) -> bool,
+    ) -> Vec<String> {
+        let dropped: Vec<String> = self
+            .daemons
+            .iter()
+            .filter(|(node, daemon)| drop(node, daemon.owner.as_deref()))
+            .map(|(node, _)| node.clone())
+            .collect();
+        if dropped.is_empty() {
+            return dropped;
+        }
+        for node in &dropped {
+            self.daemons.remove(node);
+            self.tunnels.remove(node);
+        }
+        self.accounts
+            .retain(|_, account| !dropped.contains(&account.node));
+        self.touch_models();
+        dropped
+    }
+
     /// Fill the registry from the database. Loaded daemons count as stale
     /// until they send a fresh report.
     pub fn load(

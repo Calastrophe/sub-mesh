@@ -3,7 +3,8 @@
 
 use gloo_net::http::{Request, Response};
 use mesh_core::api::{
-    self, Direction, LogEntry, Overview, SetModels, SetReserve, Subscription, UsageReport,
+    self, Direction, ListGroup, ListKind, LogEntry, Overview, RequestAccess, Session, SetModels,
+    SetReserve, SetSetting, SettingName, SettingValue, SettingsView, Subscription, UsageReport,
 };
 use mesh_core::{AccountId, ApiError, ModelAllowlist, ReserveConfig};
 use serde::de::DeserializeOwned;
@@ -117,6 +118,81 @@ pub async fn remove(id: &AccountId) -> Result<()> {
     }
     let request = build(Request::delete(&api::subscription_path(id)))?;
     execute(request).await.map(drop)
+}
+
+pub async fn session() -> Result<Session> {
+    if mock::enabled() {
+        return mock::session();
+    }
+    get_json(api::SESSION_PATH).await
+}
+
+pub async fn request_access(note: Option<String>) -> Result<Session> {
+    if mock::enabled() {
+        return mock::request_access(note);
+    }
+    let request = Request::post(api::ACCESS_REQUEST_PATH)
+        .json(&RequestAccess { note })
+        .map_err(|error| Error::Decode(error.to_string()))?;
+    decode(execute(request).await?).await
+}
+
+pub async fn settings() -> Result<SettingsView> {
+    if mock::enabled() {
+        return mock::settings();
+    }
+    get_json(api::SETTINGS_PATH).await
+}
+
+pub async fn set_entry(
+    group: ListGroup,
+    kind: ListKind,
+    value: String,
+    add: bool,
+) -> Result<SettingsView> {
+    if mock::enabled() {
+        return mock::set_entry(group, kind, &value, add);
+    }
+    let path = api::entry_path(group, kind, &value);
+    let builder = if add {
+        Request::put(&path)
+    } else {
+        Request::delete(&path)
+    };
+    decode(execute(build(builder)?).await?).await
+}
+
+pub async fn set_value(name: SettingName, value: Option<SettingValue>) -> Result<SettingsView> {
+    if mock::enabled() {
+        return mock::set_value(name, value);
+    }
+    let path = api::setting_path(name);
+    let request = match value {
+        Some(value) => Request::put(&path)
+            .json(&SetSetting { value })
+            .map_err(|error| Error::Decode(error.to_string()))?,
+        None => build(Request::delete(&path))?,
+    };
+    decode(execute(request).await?).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Approve,
+    Deny,
+    Forget,
+}
+
+pub async fn decide(login: String, decision: Decision) -> Result<SettingsView> {
+    if mock::enabled() {
+        return mock::decide(&login, decision);
+    }
+    let builder = match decision {
+        Decision::Approve => Request::post(&api::decision_path(&login, true)),
+        Decision::Deny => Request::post(&api::decision_path(&login, false)),
+        Decision::Forget => Request::delete(&api::request_path(&login)),
+    };
+    decode(execute(build(builder)?).await?).await
 }
 
 fn build(builder: gloo_net::http::RequestBuilder) -> Result<Request> {

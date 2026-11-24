@@ -450,3 +450,99 @@ async fn a_refused_websocket_logs_the_refusal() {
     assert_eq!(entries[0].error.as_deref(), Some("limit"));
     assert_eq!(entries[0].transport, Transport::Websocket);
 }
+
+#[tokio::test]
+async fn a_websocket_closes_when_its_consumer_loses_access() {
+    use mesh_core::api::{ListGroup, ListKind};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    use crate::config::TrustedProxy;
+    use crate::settings::Change;
+    use crate::testing::{PROXY_HEADER, state_exact};
+
+    let state = state_exact(Config {
+        consumers: PeerPolicy {
+            logins: vec!["alice@example.com".to_owned()],
+            ..PeerPolicy::default()
+        },
+        daemons: PeerPolicy {
+            logins: vec!["alice@example.com".to_owned()],
+            ..PeerPolicy::default()
+        },
+        trusted_proxy: TrustedProxy {
+            addrs: vec!["127.0.0.1".parse().unwrap()],
+            only: true,
+            ..TrustedProxy::default()
+        },
+        tailscale_socket: "/nonexistent/tailscaled.sock".into(),
+        web_dir: None,
+        ..Config::default()
+    });
+    let (router, _) = socket_daemon(&[]);
+    FakeDaemon::connect(&state, "node", router).await;
+    apply(&state, report("node", vec![account("a", 0.9)]), None).await;
+    let addr = serve(state.clone()).await;
+    let change = |change: Change| {
+        state
+            .settings
+            .change(
+                &state.config,
+                &state.db,
+                change,
+                None,
+                Utc::now(),
+                |effective| state.install(effective),
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let carol = || {
+        (
+            ListGroup::Consumers,
+            ListKind::Logins,
+            "carol@example.com".to_owned(),
+        )
+    };
+    let (group, kind, value) = carol();
+    change(Change::Add(group, kind, value));
+
+    let open = || {
+        let mut request = format!("ws://{addr}/codex/responses")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(PROXY_HEADER, "carol@example.com".parse().unwrap());
+        tokio_tungstenite::connect_async(request)
+    };
+    let (mut client, _) = open().await.unwrap();
+    client
+        .send(Message::Text(create("gpt-5").into()))
+        .await
+        .unwrap();
+    next_text(&mut client).await;
+    assert!(next_text(&mut client).await.starts_with("a: "));
+
+    change(Change::Add(
+        ListGroup::Consumers,
+        ListKind::Logins,
+        "dave@example.com".to_owned(),
+    ));
+    client.send(Message::Text("still".into())).await.unwrap();
+    assert_eq!(next_text(&mut client).await, "a: still");
+
+    let (group, kind, value) = carol();
+    change(Change::Remove(group, kind, value));
+    let end = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "the socket stays open");
+    wait_for_in_flight(&state, "a", 0).await;
+    assert!(open().await.is_err());
+}

@@ -16,8 +16,8 @@ use hyper::upgrade::OnUpgrade;
 use mesh_relay::tunnel::accept;
 
 use crate::AppState;
-use crate::access::authorize;
-use crate::peer::Role;
+use crate::access::authorize_grant;
+use crate::peer::{Grant, Role};
 
 /// `GET TUNNEL_PATH`
 pub async fn tunnel(
@@ -25,8 +25,8 @@ pub async fn tunnel(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    match authorize(&state, addr, request.headers(), Role::Daemon).await {
-        Ok(peer) => connect(state, peer.login, request),
+    match authorize_grant(&state, addr, request.headers(), Role::Daemon).await {
+        Ok((peer, grant)) => connect(state, peer.login, grant, request),
         Err(response) => *response,
     }
 }
@@ -37,7 +37,12 @@ pub async fn tunnel(
 /// node name that another login holds is refused with `409`. Otherwise the
 /// `101` goes back at once, and a task waits for the upgrade, registers the
 /// tunnel, and unregisters it when it closes.
-pub(crate) fn connect(state: Arc<AppState>, login: Option<String>, request: Request) -> Response {
+pub(crate) fn connect(
+    state: Arc<AppState>,
+    login: Option<String>,
+    grant: Grant,
+    request: Request,
+) -> Response {
     let accepted = match accept(request) {
         Ok(accepted) => accepted,
         Err(refusal) => return refusal.into_response(),
@@ -56,7 +61,7 @@ pub(crate) fn connect(state: Arc<AppState>, login: Option<String>, request: Requ
         )
             .into_response();
     }
-    tokio::spawn(run(state, accepted.node, login, accepted.upgrade));
+    tokio::spawn(run(state, accepted.node, login, grant, accepted.upgrade));
     accepted.response
 }
 
@@ -83,7 +88,13 @@ fn tunnel_login(
 }
 
 /// Own one tunnel from its upgrade to its end.
-async fn run(state: Arc<AppState>, node: String, login: Option<String>, upgrade: OnUpgrade) {
+async fn run(
+    state: Arc<AppState>,
+    node: String,
+    login: Option<String>,
+    grant: Grant,
+    upgrade: OnUpgrade,
+) {
     let handshake = mesh_relay::tunnel::Client::from_upgrade(upgrade);
     let Ok(result) = tokio::time::timeout(Duration::from_secs(10), handshake).await else {
         tracing::warn!(%node, "tunnel handshake timed out");
@@ -102,7 +113,7 @@ async fn run(state: Arc<AppState>, node: String, login: Option<String>, upgrade:
         let node = node.clone();
         tokio::task::spawn_blocking(move || {
             let _guard = state.reports.lock().expect("report mutex poisoned");
-            state.attach_tunnel(&node, client, login, Utc::now())
+            state.attach_tunnel(&node, client, login, grant, Utc::now())
         })
     };
     let Ok(Some(generation)) = attach.await else {
@@ -116,6 +127,12 @@ async fn run(state: Arc<AppState>, node: String, login: Option<String>, upgrade:
     }
 }
 
+pub struct Tunnel {
+    generation: u64,
+    client: mesh_relay::tunnel::Client,
+    grant: Grant,
+}
+
 impl AppState {
     /// Make `client` the tunnel of `node` and return its generation, unless
     /// another login holds the node name. An older tunnel of the node is
@@ -125,13 +142,51 @@ impl AppState {
         node: &str,
         client: mesh_relay::tunnel::Client,
         login: Option<String>,
+        grant: Grant,
         now: DateTime<Utc>,
     ) -> Option<u64> {
         self.with_registry(|registry| {
+            if !self.peers.admits(&grant, Role::Daemon) {
+                return None;
+            }
             let generation = registry.attach_tunnel(node, login, now)?;
             let mut clients = self.clients.lock().expect("tunnel mutex poisoned");
-            clients.insert(node.to_owned(), (generation, client));
+            clients.insert(
+                node.to_owned(),
+                Tunnel {
+                    generation,
+                    client,
+                    grant,
+                },
+            );
             Some(generation)
+        })
+    }
+
+    pub fn revoke_daemons(&self) -> Vec<String> {
+        self.with_registry(|registry| {
+            let mut clients = self.clients.lock().expect("tunnel mutex poisoned");
+            let revoked: Vec<String> = clients
+                .iter()
+                .filter(|(_, tunnel)| !self.peers.admits(&tunnel.grant, Role::Daemon))
+                .map(|(node, _)| node.clone())
+                .collect();
+            for node in &revoked {
+                if let Some(tunnel) = clients.remove(node) {
+                    registry.detach_tunnel(node, tunnel.generation);
+                    tunnel.client.close();
+                    tracing::info!(%node, "closed the tunnel of a daemon that lost access");
+                }
+            }
+            drop(clients);
+            let dropped = registry.drop_daemons(|node, owner| {
+                revoked.iter().any(|known| known == node)
+                    || owner.is_some_and(|owner| !self.peers.admits_login(owner, Role::Daemon))
+            });
+            for node in &dropped {
+                tracing::info!(%node, "dropped a daemon that lost access");
+            }
+            dropped
         })
     }
 
@@ -157,8 +212,8 @@ impl AppState {
         let clients = self.clients.lock().expect("tunnel mutex poisoned");
         clients
             .get(node)
-            .filter(|(current, client)| *current == generation && !client.is_closed())
-            .map(|(_, client)| client.clone())
+            .filter(|tunnel| tunnel.generation == generation && !tunnel.client.is_closed())
+            .map(|tunnel| tunnel.client.clone())
     }
 }
 

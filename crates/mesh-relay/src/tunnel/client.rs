@@ -25,6 +25,7 @@ use crate::websocket::{self, UpstreamSocket};
 pub struct Client {
     sender: SendRequest<Full<Bytes>>,
     closed: watch::Receiver<bool>,
+    shutdown: std::sync::Arc<watch::Sender<bool>>,
 }
 
 impl fmt::Debug for Client {
@@ -55,13 +56,28 @@ impl Client {
             .handshake(io)
             .await?;
         let (closed_tx, closed) = watch::channel(false);
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
         tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::debug!("tunnel connection ended: {err}");
+            let stop = async move {
+                if shutdown.wait_for(|stop| *stop).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                result = connection => {
+                    if let Err(err) = result {
+                        tracing::debug!("tunnel connection ended: {err}");
+                    }
+                }
+                () = stop => tracing::debug!("tunnel connection closed by the server"),
             }
             let _ = closed_tx.send(true);
         });
-        Ok(Client { sender, closed })
+        Ok(Client {
+            sender,
+            closed,
+            shutdown: std::sync::Arc::new(shutdown_tx),
+        })
     }
 
     /// Wait for the upgrade from [`crate::tunnel::accept`], then
@@ -74,6 +90,10 @@ impl Client {
     /// True once the tunnel has closed. Requests then fail at once.
     pub fn is_closed(&self) -> bool {
         *self.closed.borrow() || self.sender.is_closed()
+    }
+
+    pub fn close(&self) {
+        let _ = self.shutdown.send(true);
     }
 
     /// Resolves when the tunnel closes. It does not keep the tunnel open.
