@@ -407,14 +407,12 @@ async fn an_https_url_dials_tls_offering_only_http_1_1() {
         let mut hello = vec![0u8; 4096];
         let n = stream.read(&mut hello).await.unwrap();
         hello.truncate(n);
-        // Not a TLS server: closing fails the handshake.
         hello
     });
     let url = Url::parse(&format!("https://localhost:{port}")).unwrap();
     let err = Dial::connect(&url).await.expect_err("no TLS server");
     assert!(matches!(err, Error::Io(_)), "{err}");
     let hello = hello.await.unwrap();
-    // A TLS handshake record carrying the server name and the ALPN offer.
     assert_eq!(hello[0], 0x16, "{hello:?}");
     let contains = |needle: &[u8]| hello.windows(needle.len()).any(|w| w == needle);
     assert!(contains(b"localhost"));

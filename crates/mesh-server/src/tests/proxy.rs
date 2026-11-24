@@ -182,7 +182,6 @@ async fn a_daemon_tunnels_and_reports_through_the_proxy() {
     assert!(!seen[0].headers.contains_key(PROXY_HEADER));
     assert_eq!(whois_calls.load(Ordering::SeqCst), 0);
 
-    // The direct tailnet path still works beside the proxy.
     FakeDaemon::dial(&state, server, "laptop-2", Router::new()).await;
     assert_eq!(tunnel_login(&state, "laptop-2").as_deref(), Some(ALICE));
     assert!(whois_calls.load(Ordering::SeqCst) >= 1);
@@ -236,6 +235,5 @@ async fn a_node_name_through_the_proxy_stays_with_its_login() {
     assert_eq!(tunnel_login(&state, "bob-box").as_deref(), Some(BOB));
     assert_eq!(dial_refusal(as_bob, &"n".repeat(200)).await, 400);
 
-    // With `only`, a direct caller is refused without asking whois.
     assert_eq!(dial_refusal(server, "direct").await, 403);
 }

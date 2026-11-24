@@ -100,7 +100,6 @@ impl Dial {
             .map_err(|_| timed_out("connecting to the server"))??;
         let peer = tcp.peer_addr()?;
         let stream: Box<dyn ServerIo> = if tls {
-            // `host_str` keeps IPv6 brackets; a server name has none.
             let name = host.trim_start_matches('[').trim_end_matches(']');
             let name = ServerName::try_from(name.to_owned())
                 .map_err(|err| Error::Other(format!("bad server name {name:?}: {err}")))?;
