@@ -67,8 +67,8 @@ logins = ["you@example.com"]
 
 **Reverse proxy**
 
-To run the server behind a proxy that authenticates tailnet users, such as
-Caddy with `tailscale_auth`, add this to `server.toml`:
+To run the server behind a reverse proxy that authenticates tailnet users
+and passes the caller's login in a header, add this to `server.toml`:
 
 ```toml
 [trusted_proxy]
