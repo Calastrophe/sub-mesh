@@ -451,14 +451,9 @@ async fn a_refused_websocket_logs_the_refusal() {
     assert_eq!(entries[0].transport, Transport::Websocket);
 }
 
-#[tokio::test]
-async fn a_websocket_closes_when_its_consumer_loses_access() {
-    use mesh_core::api::{ListGroup, ListKind};
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
+async fn consumer_state() -> (Arc<AppState>, Opened, SocketAddr) {
     use crate::config::TrustedProxy;
-    use crate::settings::Change;
-    use crate::testing::{PROXY_HEADER, state_exact};
+    use crate::testing::state_exact;
 
     let state = state_exact(Config {
         consumers: PeerPolicy {
@@ -478,10 +473,22 @@ async fn a_websocket_closes_when_its_consumer_loses_access() {
         web_dir: None,
         ..Config::default()
     });
-    let (router, _) = socket_daemon(&[]);
+    let (router, opened) = socket_daemon(&[]);
     FakeDaemon::connect(&state, "node", router).await;
     apply(&state, report("node", vec![account("a", 0.9)]), None).await;
     let addr = serve(state.clone()).await;
+    (state, opened, addr)
+}
+
+#[tokio::test]
+async fn a_websocket_closes_when_its_consumer_loses_access() {
+    use mesh_core::api::{ListGroup, ListKind};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    use crate::settings::Change;
+    use crate::testing::PROXY_HEADER;
+
+    let (state, _, addr) = consumer_state().await;
     let change = |change: Change| {
         state
             .settings
@@ -545,4 +552,64 @@ async fn a_websocket_closes_when_its_consumer_loses_access() {
     assert!(end.is_ok(), "the socket stays open");
     wait_for_in_flight(&state, "a", 0).await;
     assert!(open().await.is_err());
+}
+
+#[tokio::test]
+async fn a_websocket_whose_consumer_lost_access_before_its_first_message_sends_nothing() {
+    use mesh_core::api::{ListGroup, ListKind};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    use crate::settings::Change;
+    use crate::testing::PROXY_HEADER;
+
+    let (state, sockets, addr) = consumer_state().await;
+    state
+        .settings
+        .change(
+            &state.config,
+            &state.db,
+            Change::Add(
+                ListGroup::Consumers,
+                ListKind::Logins,
+                "carol@example.com".to_owned(),
+            ),
+            None,
+            Utc::now(),
+            |effective| state.install(effective),
+        )
+        .unwrap()
+        .unwrap();
+    let mut request = format!("ws://{addr}/codex/responses")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(PROXY_HEADER, "carol@example.com".parse().unwrap());
+    let (mut client, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    state
+        .settings
+        .change(
+            &state.config,
+            &state.db,
+            Change::Remove(
+                ListGroup::Consumers,
+                ListKind::Logins,
+                "carol@example.com".to_owned(),
+            ),
+            None,
+            Utc::now(),
+            |effective| state.install(effective),
+        )
+        .unwrap()
+        .unwrap();
+    let _ = client.send(Message::Text(create("gpt-5").into())).await;
+    let end = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = client.next().await {
+            assert!(matches!(message, Message::Close(_)), "{message:?}");
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "the socket closes");
+    assert!(opened(&sockets).is_empty());
 }

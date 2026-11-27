@@ -98,7 +98,11 @@ pub(super) fn relay(
 /// Route and relay one accepted socket.
 async fn serve(mut run: Run<'_>, job: &Job<'_>, mut client: WebSocket, grant: &Grant) {
     let mut changes = run.state.peers.changes();
-    let Some(first) = first_message(&mut client, FIRST_MESSAGE_TIMEOUT).await else {
+    let first = tokio::select! {
+        first = first_message(&mut client, FIRST_MESSAGE_TIMEOUT) => first,
+        () = revoked(run.state, grant, &mut changes) => None,
+    };
+    let Some(first) = first else {
         return;
     };
     run.started = Instant::now();
@@ -110,6 +114,10 @@ async fn serve(mut run: Run<'_>, job: &Job<'_>, mut client: WebSocket, grant: &G
         Ok(opened) => opened,
         Err(refusal) => return refuse(client, *refusal).await,
     };
+    if !run.state.peers.admits(grant, Role::Consumer) {
+        tracing::info!(user = %run.peer.user(), "closing the WebSocket of a consumer who lost access");
+        return;
+    }
     if let Err(error) = socket.send(first).await {
         tracing::warn!(node = %candidate.node, %error, "relay first message failed");
         let response = run
