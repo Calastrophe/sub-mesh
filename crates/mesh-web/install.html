@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install a mesh client</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 42rem; margin: 3rem auto; padding: 0 1.25rem; }
+    h1 { line-height: 1.15; }
+    label { display: block; margin: 1.5rem 0 .4rem; font-weight: 650; }
+    input { box-sizing: border-box; width: 100%; padding: .7rem; font: inherit; }
+    button, a.button { display: inline-block; margin: .75rem .5rem .75rem 0; padding: .6rem .9rem; font: inherit; }
+    code { overflow-wrap: anywhere; }
+    .hint { opacity: .75; }
+  </style>
+</head>
+<body>
+  <h1>Install a mesh client</h1>
+  <p>Download both programs for your platform. <code>mesh-daemon</code> connects this machine to the mesh; <code>meshctl</code> manages the daemon.</p>
+  <p>
+    <a class="button" href="/downloads/mesh-daemon-linux-x86_64" download>Linux daemon x86_64</a>
+    <a class="button" href="/downloads/meshctl-linux-x86_64" download>Linux meshctl x86_64</a>
+    <a class="button" href="/downloads/mesh-daemon-windows-x86_64.exe" download>Windows daemon x86_64</a>
+    <a class="button" href="/downloads/meshctl-windows-x86_64.exe" download>Windows meshctl x86_64</a>
+  </p>
+  <form id="config-form">
+    <label for="mesh-url">Mesh server URL</label>
+    <input id="mesh-url" name="mesh-url" type="url" placeholder="https://mesh.example.com" required>
+    <p class="hint">Use the same origin you use to open the dashboard. Include a port if needed; do not add a path.</p>
+    <label for="tailscale-peer">Tailscale server login or ACL tag (optional)</label>
+    <input id="tailscale-peer" name="tailscale-peer" type="text" placeholder="you@example.com or tag:mesh">
+    <p class="hint">For HTTP over Tailscale only. Leave blank to trust the server under this machine's Tailscale login. HTTPS uses its TLS certificate instead.</p>
+    <button type="submit">Download daemon.toml</button>
+    <p id="error" role="alert" aria-live="polite"></p>
+  </form>
+  <p>Save the downloaded file as <code>daemon.toml</code> in your mesh config directory:</p>
+  <ul>
+    <li>Linux: <code>~/.config/mesh/daemon.toml</code> (or under <code>$XDG_CONFIG_HOME</code>)</li>
+    <li>Windows: <code>%APPDATA%\mesh\daemon.toml</code></li>
+  </ul>
+  <p>After saving the config, start <code>mesh-daemon</code>. Run <code>meshctl login codex</code> or <code>meshctl login claude</code> to add an account.</p>
+  <script>
+    document.querySelector('#config-form').addEventListener('submit', event => {
+      event.preventDefault();
+      const field = document.querySelector('#mesh-url');
+      const peerField = document.querySelector('#tailscale-peer');
+      const error = document.querySelector('#error');
+      let url;
+      try { url = new URL(field.value.trim()); } catch { url = null; }
+      const peer = peerField.value.trim();
+      if (!url || !['http:', 'https:'].includes(url.protocol) || url.pathname !== '/' || url.username || url.password || url.search || url.hash) {
+        error.textContent = 'Enter an http:// or https:// mesh origin without a path, credentials, query, or fragment.';
+        return;
+      }
+      if (peer && url.protocol === 'https:') {
+        error.textContent = 'Tailscale identity settings apply to HTTP URLs. HTTPS uses its TLS certificate for server identity.';
+        return;
+      }
+      if (/[\u0000-\u001f\u007f]/.test(peer)) {
+        error.textContent = 'The Tailscale login or tag cannot contain control characters.';
+        return;
+      }
+      error.textContent = '';
+      let config = `server_url = ${JSON.stringify(url.origin)}\n`;
+      if (peer) {
+        const key = peer.startsWith('tag:') ? 'tags' : 'logins';
+        config += `\n[allowed_peers]\n${key} = [${JSON.stringify(peer)}]\n`;
+      }
+      const blob = new Blob([config], {type: 'text/plain;charset=utf-8'});
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = 'daemon.toml';
+      link.click();
+      URL.revokeObjectURL(link.href);
+    });
+  </script>
+</body>
+</html>

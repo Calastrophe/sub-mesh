@@ -1,6 +1,8 @@
 mod credentials;
 pub(crate) mod models;
 pub(crate) mod reserve;
+pub(crate) mod service;
+pub(crate) mod setup;
 
 use std::io;
 use std::path::PathBuf;
@@ -55,8 +57,18 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         json,
         command,
     } = cli;
+    let command = command.unwrap_or(Command::Status);
+    let command = match command {
+        Command::Reload => return service::reload(json),
+        Command::Setup {
+            server_url,
+            tailscale_peer,
+            yes,
+        } => return setup::run(server_url, tailscale_peer, yes),
+        command => command,
+    };
     let ctx = AppContext::new(admin, data_dir, json)?;
-    let (method, path, message) = match command.unwrap_or(Command::Status) {
+    let (method, path, message) = match command {
         Command::Login { provider, manual } => {
             return credentials::login(&ctx, provider, manual).await;
         }
@@ -66,6 +78,8 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
                 print!("{}", render::render_status(&status, Utc::now()));
             });
         }
+        Command::Reload => unreachable!("reload handled before constructing app context"),
+        Command::Setup { .. } => unreachable!("setup handled before constructing app context"),
         Command::Pause { id } => (Method::POST, admin::pause_path(&id), format!("paused {id}")),
         Command::Resume { id } => (
             Method::POST,

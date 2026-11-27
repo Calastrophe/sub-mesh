@@ -77,7 +77,7 @@ fn default_tailscale_socket() -> PathBuf {
 #[serde(default, deny_unknown_fields)]
 pub struct PeerPolicy {
     /// Logins the server may run as. Empty means "the same login as this
-    /// machine".
+    /// machine" when `tags` is also empty.
     pub logins: Vec<String>,
     /// ACL tags the server may carry, such as `tag:mesh`.
     pub tags: Vec<String>,

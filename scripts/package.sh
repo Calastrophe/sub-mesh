@@ -2,7 +2,7 @@
 # Packs built files into one release archive. The release workflow runs this,
 # and you can run it by hand to test an archive.
 #
-#   scripts/package.sh VERSION PLATFORM BIN_DIR WEB_DIR OUT_DIR
+#   scripts/package.sh VERSION PLATFORM BIN_DIR OTHER_BIN_DIR WEB_DIR OUT_DIR
 #
 # PLATFORM is x86_64-linux or x86_64-windows. BIN_DIR holds the built
 # binaries. WEB_DIR is the built dashboard (trunk's dist); the Windows archive
@@ -13,16 +13,17 @@ set -eu
 umask 022
 export TZ=UTC
 
-[ $# -eq 5 ] || {
-    echo 'Usage: package.sh VERSION PLATFORM BIN_DIR WEB_DIR OUT_DIR' >&2
+[ $# -eq 6 ] || {
+    echo 'Usage: package.sh VERSION PLATFORM BIN_DIR OTHER_BIN_DIR WEB_DIR OUT_DIR' >&2
     exit 2
 }
 
 version=$1
 platform=$2
 bin_dir=$3
-web_dir=$4
-out_dir=$5
+other_bin_dir=$4
+web_dir=$5
+out_dir=$6
 
 printf '%s\n' "$version" | LC_ALL=C awk '
     NR == 1 && /^[0-9]+\.[0-9]+\.[0-9]+$/ { ok = 1 }
@@ -66,6 +67,12 @@ x86_64-linux)
     [ -z "$special" ] || { echo "Unsupported dashboard file: $special" >&2; exit 1; }
     cp -R -- "$web_dir"/. "$stage/web/"
     rm -f "$stage/web/.trunk-lock"
+    mkdir -p "$stage/web/downloads"
+    put 0755 "$bin_dir/meshctl" web/downloads/meshctl-linux-x86_64
+    put 0755 "$bin_dir/mesh-daemon" web/downloads/mesh-daemon-linux-x86_64
+    put 0644 "$other_bin_dir/meshctl.exe" web/downloads/meshctl-windows-x86_64.exe
+    put 0644 "$other_bin_dir/mesh-daemon.exe" web/downloads/mesh-daemon-windows-x86_64.exe
+    put 0644 "$root/crates/mesh-web/install.html" web/install.html
     chmod -R u=rwX,go=rX "$stage/web"
     put 0644 "$root/contrib/mesh-server.service" contrib/mesh-server.service
     put 0644 "$root/contrib/mesh-daemon.service" contrib/mesh-daemon.service
