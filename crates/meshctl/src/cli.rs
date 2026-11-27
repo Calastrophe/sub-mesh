@@ -36,6 +36,19 @@ pub(crate) enum Command {
     },
     /// Show the daemon's state (the default command).
     Status,
+    /// Restart mesh-daemon so it reloads daemon.toml.
+    Reload,
+    /// Configure this machine to connect to a mesh server.
+    Setup {
+        /// Mesh server URL, such as http://mesh-host:7070.
+        server_url: Option<String>,
+        /// Tailscale login or ACL tag that runs the server (for a different identity).
+        #[arg(long, value_name = "LOGIN_OR_TAG")]
+        tailscale_peer: Option<String>,
+        /// Replace an existing daemon config without prompting.
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Stop sharing an account.
     Pause { id: AccountId },
     /// Resume sharing an account.

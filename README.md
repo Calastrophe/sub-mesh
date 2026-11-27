@@ -33,8 +33,22 @@ $env:MESH_SERVER_URL = 'http://mesh-host:7070'
 irm https://raw.githubusercontent.com/Calastrophe/sub-mesh/main/install.ps1 | iex
 ```
 
+Run `meshctl setup` on each client machine and enter the mesh server URL, such
+as `https://mesh.graybird.software`. HTTPS URLs use their TLS certificate for
+server identity. For direct HTTP over Tailscale, use its MagicDNS name or
+tailnet IP, such as `http://mesh-server:7070`; the daemon checks the server's
+Tailscale identity and setup asks for its login or ACL tag when needed.
+After editing `daemon.toml`, run `meshctl reload` to restart the installed
+daemon service and load the new settings.
+
 Run `meshctl login codex` or `meshctl login claude`, then check
 `meshctl status`. Run the installer again to upgrade.
+
+**Install a mesh client from your mesh website**
+
+Open `https://mesh.graybird.software/install.html` (or your configured mesh
+website) to download both client binaries and generate a `daemon.toml`
+configuration file for your mesh URL and optional Tailscale peer identity.
 
 ## Configuration
 
@@ -54,7 +68,8 @@ logins = ["you@example.com"]
 tags = ["tag:mesh"]
 ```
 
-Empty `logins` means the server's own tailnet login.
+When both lists are empty, the server must use the daemon's own tailnet login.
+When a login or tag is listed, only those identities are trusted.
 
 **Daemon**
 

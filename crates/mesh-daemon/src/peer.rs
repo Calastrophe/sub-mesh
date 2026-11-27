@@ -31,7 +31,7 @@ pub async fn verify_server(state: &AppState, server: SocketAddr) -> Result<(), S
     }
     let login = &whois.login_name;
     if !login.trim().is_empty() {
-        let allowed = if policy.logins.is_empty() {
+        let allowed = if policy.logins.is_empty() && policy.tags.is_empty() {
             state
                 .refresh_owner()
                 .await

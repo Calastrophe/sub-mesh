@@ -132,6 +132,23 @@ async fn logins_and_tags_widen_trust() {
 }
 
 #[tokio::test]
+async fn an_explicit_tag_does_not_also_trust_the_machine_login() {
+    let remote = "100.64.0.9:7070".parse().unwrap();
+    let state = state("peer-tag-only", "[allowed_peers]\ntags = [\"tag:mesh\"]");
+    state.set_owner(Some(OWNER.to_owned()));
+    let reply = Arc::new(std::sync::Mutex::new(whois_reply(OWNER, "null")));
+    let current = reply.clone();
+    serve_tailscaled(&state, move || current.lock().unwrap().clone());
+
+    assert!(verify_server(&state, remote).await.is_err());
+    *reply.lock().unwrap() = whois_reply("tagged-devices", r#"["tag:mesh"]"#);
+    assert!(verify_server(&state, remote).await.is_ok());
+    *reply.lock().unwrap() = whois_reply("tagged-devices", r#"["tag:other"]"#);
+    assert!(verify_server(&state, remote).await.is_err());
+    let _ = std::fs::remove_dir_all(&state.settings.data_dir);
+}
+
+#[tokio::test]
 async fn unreachable_tailscaled_refuses_the_server() {
     let state = state("peer-no-tailscaled", "");
     let err = verify_server(&state, "100.64.0.9:7070".parse().unwrap())
