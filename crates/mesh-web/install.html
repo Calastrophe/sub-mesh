@@ -39,6 +39,7 @@
     <li>Linux: <code>~/.config/mesh/daemon.toml</code> (or under <code>$XDG_CONFIG_HOME</code>)</li>
     <li>Windows: <code>%APPDATA%\mesh\daemon.toml</code></li>
   </ul>
+  <p>The daemon connects only if your login is on the server's daemon list. Approval of an access request adds you as a consumer only, so ask an admin to add your login under Daemons in the dashboard's Settings.</p>
   <p>After saving the config, start <code>mesh-daemon</code>. Run <code>meshctl login codex</code> or <code>meshctl login claude</code> to add an account.</p>
   <script>
     document.querySelector('#config-form').addEventListener('submit', event => {
