@@ -2,23 +2,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
+use toml::{Table, Value};
 use url::Url;
-
-#[derive(Serialize)]
-struct DaemonConfig {
-    server_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_peers: Option<AllowedPeers>,
-}
-
-#[derive(Serialize)]
-struct AllowedPeers {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    logins: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tags: Vec<String>,
-}
 
 pub(crate) fn run(
     server_url: Option<String>,
@@ -53,34 +38,62 @@ pub(crate) fn run(
         }
     };
 
-    let peers = peer.map(|peer| {
-        if peer.starts_with("tag:") {
-            AllowedPeers {
-                logins: Vec::new(),
-                tags: vec![peer],
-            }
-        } else {
-            AllowedPeers {
-                logins: vec![peer],
-                tags: Vec::new(),
-            }
-        }
-    });
-    let config = toml::to_string(&DaemonConfig {
-        server_url,
-        allowed_peers: peers,
-    })
-    .context("cannot serialize daemon config")?;
-
     let path = config_path()?;
     if path.exists() && !yes && !confirm_replace(&path)? {
         println!("Setup cancelled; kept {}.", path.display());
         return Ok(());
     }
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", path.display()));
+        }
+    };
+    let config = merge(existing.as_deref(), &server_url, peer.as_deref())
+        .with_context(|| format!("cannot update {}", path.display()))?;
     write_config(&path, &config)?;
     println!("Wrote {}.", path.display());
     println!("Start mesh-daemon to connect to the mesh.");
     Ok(())
+}
+
+/// Set the server and the pinned server identity in `existing`, keeping
+/// every other setting. `peer` is a login or an ACL tag; without one, the
+/// pinned logins and tags are removed.
+fn merge(existing: Option<&str>, server_url: &str, peer: Option<&str>) -> Result<String> {
+    let mut config: Table = match existing {
+        Some(text) => text
+            .parse()
+            .context("the existing config is not valid TOML")?,
+        None => Table::new(),
+    };
+    config.insert(
+        "server_url".to_owned(),
+        Value::String(server_url.to_owned()),
+    );
+    let mut peers = match config.remove("allowed_peers") {
+        Some(Value::Table(table)) => table,
+        Some(_) => bail!("allowed_peers must be a table"),
+        None => Table::new(),
+    };
+    peers.remove("logins");
+    peers.remove("tags");
+    if let Some(peer) = peer {
+        let key = if peer.starts_with("tag:") {
+            "tags"
+        } else {
+            "logins"
+        };
+        peers.insert(
+            key.to_owned(),
+            Value::Array(vec![Value::String(peer.to_owned())]),
+        );
+    }
+    if !peers.is_empty() {
+        config.insert("allowed_peers".to_owned(), Value::Table(peers));
+    }
+    toml::to_string(&config).context("cannot serialize daemon config")
 }
 
 fn validate_url(input: &str) -> Result<String> {
@@ -143,13 +156,13 @@ fn write_config(path: &Path, contents: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("invalid config path"))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("cannot create config directory {}", parent.display()))?;
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!(
-                "refusing to replace non-regular config path {}",
-                path.display()
-            );
-        }
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        bail!(
+            "refusing to replace non-regular config path {}",
+            path.display()
+        );
     }
     let mut reserved = None;
     for attempt in 0..100 {
@@ -211,6 +224,31 @@ mod tests {
         );
         assert!(validate_url("https://mesh.graybird.software/mesh").is_err());
         assert!(validate_url("https://user@mesh.graybird.software").is_err());
+    }
+
+    #[test]
+    fn setup_keeps_unrelated_settings() {
+        let existing = "server_url = \"http://old:7070\"\nnode = \"box\"\ndata_dir = \"/srv/mesh\"\n\n[allowed_peers]\nlogins = [\"old@example.com\"]\nallow_loopback = true\n\n[reserve]\nfive_hour = 0.2\n";
+        let merged: Table = merge(Some(existing), "https://mesh.example", Some("tag:mesh"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(merged["server_url"].as_str(), Some("https://mesh.example"));
+        assert_eq!(merged["node"].as_str(), Some("box"));
+        assert_eq!(merged["data_dir"].as_str(), Some("/srv/mesh"));
+        assert_eq!(merged["reserve"]["five_hour"].as_float(), Some(0.2));
+        let peers = merged["allowed_peers"].as_table().unwrap();
+        assert!(!peers.contains_key("logins"));
+        assert_eq!(peers["tags"][0].as_str(), Some("tag:mesh"));
+        assert_eq!(peers["allow_loopback"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn setup_without_a_peer_clears_the_pinned_identity() {
+        let existing = "server_url = \"http://old:7070\"\n[allowed_peers]\nlogins = [\"a@b\"]\n";
+        let merged = merge(Some(existing), "https://mesh.example", None).unwrap();
+        assert_eq!(merged, "server_url = \"https://mesh.example\"\n");
+        assert!(merge(Some("not = [valid"), "https://mesh.example", None).is_err());
     }
 
     #[test]
